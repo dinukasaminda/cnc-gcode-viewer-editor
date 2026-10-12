@@ -1,0 +1,1 @@
+tool effective width(will calculate from milling z depth and v tip angle and v tip kind of things )  and v tip width are two diffrent values, 
