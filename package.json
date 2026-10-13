@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test:sample": "node scripts/test-sample.mjs && node scripts/sim-sample.mjs"
+    "test:sample": "node scripts/test-sample.mjs && node scripts/sim-sample.mjs && node scripts/test-rewrite.mjs"
   },
   "dependencies": {
     "@types/three": "^0.186.0",

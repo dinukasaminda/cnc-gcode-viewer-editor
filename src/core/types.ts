@@ -129,11 +129,21 @@ export interface Measurement {
   points: { x: number; y: number; z: number }[];
 }
 
+/** Standard 1 oz copper cladding thickness (mm). */
+export const STANDARD_COPPER_THICKNESS_MM = 0.035;
+
+/** Common copper weights for PCB stock. */
+export const COPPER_THICKNESS_PRESETS = [
+  { label: '1 oz (standard)', mm: 0.035 },
+  { label: '½ oz', mm: 0.0175 },
+  { label: '2 oz', mm: 0.07 },
+] as const;
+
 export const DEFAULT_STOCK: StockSettings = {
   width: 50,
   height: 25,
   thickness: 1.6,
-  copperThickness: 0.035,
+  copperThickness: STANDARD_COPPER_THICKNESS_MM,
   originX: 0,
   originY: 0,
   surfaceZ: 0,

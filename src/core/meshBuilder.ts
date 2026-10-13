@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { formatMm } from './format';
 import type { HeightFieldStock } from './stock';
 import type { JobFile, ViewMode } from './types';
 
@@ -247,4 +248,190 @@ export function buildToolMarker(): THREE.Group {
   cone.position.y = 0.6;
   g.add(cone);
   return g;
+}
+
+type AnnotBag = {
+  pts: number[];
+  disposables: THREE.BufferGeometry[];
+  materials: THREE.Material[];
+  textures: THREE.Texture[];
+  group: THREE.Group;
+};
+
+function pushSeg(
+  pts: number[],
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number
+) {
+  pts.push(ax, ay, az, bx, by, bz);
+}
+
+function addLabelSprite(
+  bag: AnnotBag,
+  text: string,
+  x: number,
+  y: number,
+  z: number,
+  worldW = 14,
+  worldH = 3.2
+) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 320;
+  canvas.height = 72;
+  const ctx2d = canvas.getContext('2d')!;
+  ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+  ctx2d.fillStyle = 'rgba(15, 23, 42, 0.75)';
+  ctx2d.fillRect(6, 8, 308, 56);
+  ctx2d.fillStyle = '#f8fafc';
+  ctx2d.font = 'bold 26px ui-sans-serif, system-ui, sans-serif';
+  ctx2d.textAlign = 'center';
+  ctx2d.textBaseline = 'middle';
+  ctx2d.fillText(text, 160, 36);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  bag.textures.push(tex);
+  const spriteMat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthTest: false,
+  });
+  bag.materials.push(spriteMat);
+  const sprite = new THREE.Sprite(spriteMat);
+  sprite.scale.set(worldW, worldH, 1);
+  sprite.position.set(x, y, z);
+  bag.group.add(sprite);
+}
+
+function addEndCap(
+  bag: AnnotBag,
+  x: number,
+  y: number,
+  z: number,
+  sx: number,
+  sy: number,
+  sz: number,
+  color = 0xfbbf24
+) {
+  const mat = new THREE.MeshBasicMaterial({ color });
+  bag.materials.push(mat);
+  const geo = new THREE.BoxGeometry(sx, sy, sz);
+  bag.disposables.push(geo);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y, z);
+  bag.group.add(mesh);
+}
+
+/**
+ * World-space plot annotations:
+ * - 20 mm (2 cm) comparison ruler at top-center (actual-size check)
+ * - PCB width dimension along bottom edge
+ * - PCB height dimension along left edge
+ */
+export function buildComparisonRuler(stock: HeightFieldStock): BoardMeshes {
+  const group = new THREE.Group();
+  group.name = 'comparison-ruler';
+
+  const bag: AnnotBag = {
+    pts: [],
+    disposables: [],
+    materials: [],
+    textures: [],
+    group,
+  };
+
+  const yLift = 0.12;
+  const gap = 3.5;
+  const tickOut = 2.6;
+  const xMin = stock.originX;
+  const xMax = stock.originX + stock.widthMm;
+  const zMin = stock.originY;
+  const zMax = stock.originY + stock.heightMm;
+  const cx = (xMin + xMax) / 2;
+  const cz = (zMin + zMax) / 2;
+  const w = stock.widthMm;
+  const h = stock.heightMm;
+
+  // —— 2 cm comparison ruler (top center, outside PCB) ——
+  {
+    const LENGTH_MM = 20;
+    const zBase = zMax + gap;
+    const x0 = cx - LENGTH_MM / 2;
+    const x1 = cx + LENGTH_MM / 2;
+    pushSeg(bag.pts, x0, yLift, zBase, x1, yLift, zBase);
+    for (let i = 0; i <= LENGTH_MM; i++) {
+      const x = x0 + i;
+      let tick = 1.0;
+      if (i % 10 === 0) tick = 2.8;
+      else if (i % 5 === 0) tick = 1.9;
+      pushSeg(bag.pts, x, yLift, zBase, x, yLift, zBase + tick);
+    }
+    addEndCap(bag, x0, yLift, zBase + 1.4, 0.18, 0.12, 3.0);
+    addEndCap(bag, x1, yLift, zBase + 1.4, 0.18, 0.12, 3.0);
+    addLabelSprite(bag, '2 cm  ·  20 mm', cx, yLift + 0.5, zBase + 5.2, 12, 3);
+  }
+
+  // —— PCB width (along bottom / −Y edge) ——
+  {
+    const zDim = zMin - gap;
+    pushSeg(bag.pts, xMin, yLift, zDim, xMax, yLift, zDim);
+    // Extension ticks toward board
+    pushSeg(bag.pts, xMin, yLift, zDim, xMin, yLift, zDim + tickOut);
+    pushSeg(bag.pts, xMax, yLift, zDim, xMax, yLift, zDim + tickOut);
+    // Outer end caps
+    addEndCap(bag, xMin, yLift, zDim - 0.2, 0.2, 0.12, 2.4, 0x38bdf8);
+    addEndCap(bag, xMax, yLift, zDim - 0.2, 0.2, 0.12, 2.4, 0x38bdf8);
+    addLabelSprite(
+      bag,
+      `W  ${formatMm(w)}`,
+      cx,
+      yLift + 0.5,
+      zDim - 4.2,
+      Math.min(22, Math.max(12, w * 0.35)),
+      3.2
+    );
+  }
+
+  // —— PCB height (along left / −X edge) ——
+  {
+    const xDim = xMin - gap;
+    pushSeg(bag.pts, xDim, yLift, zMin, xDim, yLift, zMax);
+    pushSeg(bag.pts, xDim, yLift, zMin, xDim + tickOut, yLift, zMin);
+    pushSeg(bag.pts, xDim, yLift, zMax, xDim + tickOut, yLift, zMax);
+    addEndCap(bag, xDim - 0.2, yLift, zMin, 2.4, 0.12, 0.2, 0x38bdf8);
+    addEndCap(bag, xDim - 0.2, yLift, zMax, 2.4, 0.12, 0.2, 0x38bdf8);
+    addLabelSprite(
+      bag,
+      `H  ${formatMm(h)}`,
+      xDim - 5.5,
+      yLift + 0.5,
+      cz,
+      Math.min(22, Math.max(12, h * 0.35)),
+      3.2
+    );
+  }
+
+  const lineMat = new THREE.LineBasicMaterial({
+    color: 0xf8fafc,
+    depthTest: true,
+    transparent: true,
+    opacity: 0.95,
+  });
+  bag.materials.push(lineMat);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(bag.pts, 3));
+  bag.disposables.push(geo);
+  group.add(new THREE.LineSegments(geo, lineMat));
+
+  return {
+    group,
+    dispose: () => {
+      for (const g of bag.disposables) g.dispose();
+      for (const m of bag.materials) m.dispose();
+      for (const t of bag.textures) t.dispose();
+    },
+  };
 }

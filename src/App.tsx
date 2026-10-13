@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FlatcamHelper } from './components/FlatcamHelper';
+import { FlatcamHelper, type GcodeRewriteRequest } from './components/FlatcamHelper';
+import { NumberInput } from './components/NumberInput';
 import { Viewer3D } from './components/Viewer3D';
+import { formatMm, formatMmMin, formatNum, formatPct, roundMm } from './core/format';
 import { parseGCode } from './core/gcodeParser';
+import {
+  downloadTextFile,
+  rewriteGCodeCutZ,
+  suggestedDownloadName,
+} from './core/gcodeRewrite';
 import { concatTimeline } from './core/materialRemoval';
 import { applyMaterialRemoval } from './core/materialRemoval';
 import { stockFromBounds } from './core/stock';
@@ -9,9 +16,11 @@ import type { HeightFieldStock } from './core/stock';
 import { guessToolFromMetadata, toolLabel, vbitEffectiveDiameter } from './core/tools';
 import { validateJobs } from './core/validator';
 import {
+  COPPER_THICKNESS_PRESETS,
   DEFAULT_STOCK,
   DEFAULT_VBIT,
   JOB_COLORS,
+  STANDARD_COPPER_THICKNESS_MM,
   type CameraMode,
   type JobFile,
   type Measurement,
@@ -51,8 +60,9 @@ export default function App() {
   const [stock, setStock] = useState<StockSettings>({ ...DEFAULT_STOCK });
   const [field, setField] = useState<HeightFieldStock | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('final');
-  const [cameraMode, setCameraMode] = useState<CameraMode>('perspective');
-  const [flipX, setFlipX] = useState(false);
+  const [cameraMode, setCameraMode] = useState<CameraMode>('top');
+  // Confirmed: G-code +X must be mirrored in the viewer so copper text/traces read correctly
+  const [flipX, setFlipX] = useState(true);
   const [showAxes, setShowAxes] = useState(true);
   const [sim, setSim] = useState<SimulationState>(idleSim);
   const [busy, setBusy] = useState(false);
@@ -60,12 +70,34 @@ export default function App() {
   const [grooveWidth, setGrooveWidth] = useState(0);
   const [status, setStatus] = useState('Load a FlatCAM .nc file to preview the final PCB.');
   const [resetViewKey, setResetViewKey] = useState(0);
+  const [helperResetKey, setHelperResetKey] = useState(0);
   const [measureMode, setMeasureMode] = useState(false);
   const [measurePoints, setMeasurePoints] = useState<{ x: number; y: number; z: number }[]>([]);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const workerRef = useRef<Worker | null>(null);
   const simTimer = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  /** Clear prior job UI/session state when opening a new file. */
+  const resetSessionForNewFile = useCallback(() => {
+    if (simTimer.current) {
+      window.clearInterval(simTimer.current);
+      simTimer.current = null;
+    }
+    setField(null);
+    setSim(idleSim);
+    setBusy(false);
+    setProgress(0);
+    setGrooveWidth(0);
+    setMeasureMode(false);
+    setMeasurePoints([]);
+    setMeasurements([]);
+    setStock({ ...DEFAULT_STOCK });
+    setViewMode('final');
+    setCameraMode('top');
+    setResetViewKey((k) => k + 1);
+    setHelperResetKey((k) => k + 1);
+  }, []);
 
   const warnings = useMemo(() => validateJobs(jobs, stock), [jobs, stock]);
   const timeline = useMemo(() => concatTimeline(jobs), [jobs]);
@@ -74,11 +106,16 @@ export default function App() {
     if (!j || j.tool.type !== 'vbit') return null;
     return {
       job: j,
-      tipWidthMm: j.tool.tipDiameter,
-      angleDeg: j.tool.angle,
+      tipWidthMm: roundMm(j.tool.tipDiameter),
+      angleDeg: roundMm(j.tool.angle),
       cutDepthMm:
-        j.parse?.metadata.zCut != null ? Math.abs(j.parse.metadata.zCut) : undefined,
-      gcodeToolDiaMm: j.parse?.metadata.toolDiameter,
+        j.parse?.metadata.zCut != null
+          ? roundMm(Math.abs(j.parse.metadata.zCut))
+          : undefined,
+      gcodeToolDiaMm:
+        j.parse?.metadata.toolDiameter != null
+          ? roundMm(j.parse.metadata.toolDiameter)
+          : undefined,
     };
   }, [jobs]);
 
@@ -118,7 +155,7 @@ export default function App() {
             setStatus(
               `Done — ${res.appliedSegments ?? 0} cut segments` +
                 (res.effectiveGrooveWidthMm
-                  ? `, avg V-groove ≈ ${res.effectiveGrooveWidthMm.toFixed(3)} mm`
+                  ? `, avg V-groove ≈ ${formatMm(res.effectiveGrooveWidthMm)}`
                   : '')
             );
           } catch (e) {
@@ -145,7 +182,7 @@ export default function App() {
         setBusy(false);
         setProgress(1);
         setStatus(
-          `Done — ${result.appliedSegments} cut segments, avg V-groove ≈ ${result.effectiveGrooveWidthMm.toFixed(3)} mm`
+          `Done — ${result.appliedSegments} cut segments, avg V-groove ≈ ${formatMm(result.effectiveGrooveWidthMm)}`
         );
       }
     },
@@ -153,7 +190,8 @@ export default function App() {
   );
 
   const ingestText = useCallback(
-    async (name: string, text: string, replace = false) => {
+    async (name: string, text: string) => {
+      resetSessionForNewFile();
       const parse = parseGCode(text);
       // FlatCAM TOOL DIAMETER comment = effective Tool Dia at Cut Z, not V tip width
       const tool = guessToolFromMetadata(
@@ -168,39 +206,24 @@ export default function App() {
         enabled: true,
         tool,
         parse,
-        color: JOB_COLORS[(replace ? 0 : jobs.length) % JOB_COLORS.length],
+        color: JOB_COLORS[0],
       };
-      const nextJobs = replace ? [job] : [...jobs, job];
+      const nextJobs = [job];
       setJobs(nextJobs);
 
-      let nextStock = stock;
-      if (parse.metadata.xMin != null && parse.metadata.xMax != null) {
-        nextStock = stockFromBounds(
-          {
-            minX: parse.bounds.minX,
-            minY: parse.bounds.minY,
-            maxX: parse.bounds.maxX,
-            maxY: parse.bounds.maxY,
-          },
-          stock
-        );
-        setStock(nextStock);
-      } else {
-        nextStock = stockFromBounds(parse.bounds, stock);
-        setStock(nextStock);
-      }
-
-      setSim(idleSim);
+      const nextStock = stockFromBounds(parse.bounds, { ...DEFAULT_STOCK });
+      setStock(nextStock);
+      setStatus(`Loaded ${name}`);
       runSimulation(nextJobs, nextStock);
     },
-    [jobs, stock, runSimulation]
+    [resetSessionForNewFile, runSimulation]
   );
 
   const loadSample = useCallback(async () => {
     setStatus('Loading sample…');
     const res = await fetch(SAMPLE);
     const text = await res.text();
-    await ingestText('00000_gcode-test-F_Cu.gbr_iso_combined_cnc.nc', text, true);
+    await ingestText('00000_gcode-test-F_Cu.gbr_iso_combined_cnc.nc', text);
   }, [ingestText]);
 
   // Auto-load sample on first visit
@@ -215,36 +238,82 @@ export default function App() {
 
   const onFiles = async (fileList: FileList | null) => {
     if (!fileList?.length) return;
-    let next = [...jobs];
-    let nextStock = stock;
-    for (const file of Array.from(fileList)) {
-      const text = await file.text();
-      const parse = parseGCode(text);
-      const tool = guessToolFromMetadata(
-        parse.metadata.toolDiameter,
-        file.name,
-        parse.metadata.zCut
-      );
-      next.push({
-        id: newId(),
-        name: file.name,
-        source: text,
-        enabled: true,
-        tool,
-        parse,
-        color: JOB_COLORS[next.length % JOB_COLORS.length],
-      });
-      nextStock = stockFromBounds(parse.bounds, nextStock);
-    }
-    setJobs(next);
+    // Open replaces any existing job and resets session state
+    resetSessionForNewFile();
+    const file = fileList[0];
+    const text = await file.text();
+    const parse = parseGCode(text);
+    const tool = guessToolFromMetadata(
+      parse.metadata.toolDiameter,
+      file.name,
+      parse.metadata.zCut
+    );
+    const job: JobFile = {
+      id: newId(),
+      name: file.name,
+      source: text,
+      enabled: true,
+      tool,
+      parse,
+      color: JOB_COLORS[0],
+    };
+    const nextJobs = [job];
+    const nextStock = stockFromBounds(parse.bounds, { ...DEFAULT_STOCK });
+    setJobs(nextJobs);
     setStock(nextStock);
-    setSim(idleSim);
-    runSimulation(next, nextStock);
+    setStatus(`Loaded ${file.name}`);
+    runSimulation(nextJobs, nextStock);
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const updateJobTool = (id: string, tool: Tool) => {
     setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, tool } : j)));
   };
+
+  const applyRewriteToActiveJob = useCallback(
+    (req: GcodeRewriteRequest, alsoDownload: boolean) => {
+      const target = jobs.find((j) => j.enabled && j.tool.type === 'vbit') ?? jobs[0];
+      if (!target) {
+        setStatus('Load a V-bit / isolation .nc file first.');
+        return;
+      }
+      const result = rewriteGCodeCutZ(target.source, {
+        toolDiaMm: req.toolDiaMm,
+        tipWidthMm: req.tipWidthMm,
+        angleDeg: req.angleDeg,
+        cutZMm: req.cutZMm,
+      });
+      const parse = parseGCode(result.text);
+      const tool: Tool = {
+        type: 'vbit',
+        tipDiameter: req.tipWidthMm,
+        angle: req.angleDeg,
+        shankDiameter: 3.175,
+      };
+      const updated: JobFile = {
+        ...target,
+        source: result.text,
+        tool,
+        parse,
+        name: target.name.replace(/\.nc$/i, '') + `_Z${formatNum(result.newCutZ)}.nc`,
+      };
+      const next = jobs.map((j) => (j.id === target.id ? updated : j));
+      setJobs(next);
+      setSim(idleSim);
+      runSimulation(next, stock);
+      setStatus(
+        `Rewrote G-code: Tool Dia ${formatMm(result.toolDiaMm)} → Cut Z ${formatMm(result.newCutZ)}` +
+          ` (${result.replacedZCount} Z words updated)`
+      );
+      if (alsoDownload) {
+        downloadTextFile(
+          suggestedDownloadName(target.name, result.toolDiaMm, result.newCutZ),
+          result.text
+        );
+      }
+    },
+    [jobs, stock, runSimulation]
+  );
 
   const toggleJob = (id: string) => {
     setJobs((prev) => {
@@ -363,7 +432,7 @@ export default function App() {
             {
               id: newId(),
               kind: 'distance',
-              label: `Distance ${dist.toFixed(3)} mm (depths ${depthA.toFixed(3)} / ${depthB.toFixed(3)})`,
+              label: `Distance ${formatMm(dist)} (depths ${formatMm(depthA)} / ${formatMm(depthB)})`,
               valueMm: dist,
               points: [a, b],
             },
@@ -414,7 +483,6 @@ export default function App() {
             ref={fileInputRef}
             type="file"
             accept=".nc,.gcode,.ngc,.txt"
-            multiple
             hidden
             onChange={(e) => onFiles(e.target.files)}
           />
@@ -461,49 +529,50 @@ export default function App() {
                     {j.tool.type === 'vbit' && (
                       <>
                         <label title="Physical V-bit tip width — not FlatCAM Tool Dia">
-                          V tip width
-                          <input
-                            type="number"
-                            step="0.01"
+                          V tip width (mm)
+                          <NumberInput
+                            step={0.001}
+                            min={0}
                             value={j.tool.tipDiameter}
-                            onChange={(e) =>
+                            onChange={(v) =>
                               updateJobTool(j.id, {
                                 ...j.tool,
-                                tipDiameter: parseFloat(e.target.value) || 0,
+                                tipDiameter: v,
                               } as Tool)
                             }
                           />
                         </label>
                         <label>
-                          V angle
-                          <input
-                            type="number"
-                            step="1"
+                          V angle (°)
+                          <NumberInput
+                            step={0.001}
+                            min={0}
                             value={j.tool.angle}
-                            onChange={(e) =>
+                            onChange={(v) =>
                               updateJobTool(j.id, {
                                 ...j.tool,
-                                angle: parseFloat(e.target.value) || 30,
+                                angle: v || 30,
                               } as Tool)
                             }
                           />
                         </label>
                         <p className="muted tiny tool-eff">
                           Effective @ |Cut Z|{' '}
-                          {Math.abs(j.parse?.metadata.zCut ?? 0.1).toFixed(3)} mm →{' '}
+                          {formatMm(Math.abs(j.parse?.metadata.zCut ?? 0.1))} →{' '}
                           <strong>
-                            {vbitEffectiveDiameter(
-                              j.tool.tipDiameter,
-                              j.tool.angle,
-                              Math.abs(j.parse?.metadata.zCut ?? 0.1)
-                            ).toFixed(3)}{' '}
-                            mm
+                            {formatMm(
+                              vbitEffectiveDiameter(
+                                j.tool.tipDiameter,
+                                j.tool.angle,
+                                Math.abs(j.parse?.metadata.zCut ?? 0.1)
+                              )
+                            )}
                           </strong>{' '}
                           (= FlatCAM Tool Dia)
                           {j.parse?.metadata.toolDiameter != null && (
                             <>
                               {' '}
-                              · G-code said {j.parse.metadata.toolDiameter.toFixed(3)} mm
+                              · G-code said {formatMm(j.parse.metadata.toolDiameter)}
                             </>
                           )}
                         </p>
@@ -511,15 +580,15 @@ export default function App() {
                     )}
                     {(j.tool.type === 'drill' || j.tool.type === 'endmill') && (
                       <label>
-                        Diameter (FlatCAM Tool Dia)
-                        <input
-                          type="number"
-                          step="0.05"
+                        Diameter (FlatCAM Tool Dia) (mm)
+                        <NumberInput
+                          step={0.001}
+                          min={0}
                           value={j.tool.diameter}
-                          onChange={(e) =>
+                          onChange={(v) =>
                             updateJobTool(j.id, {
                               ...j.tool,
-                              diameter: parseFloat(e.target.value) || 0,
+                              diameter: v,
                             } as Tool)
                           }
                         />
@@ -533,13 +602,26 @@ export default function App() {
                 </li>
               ))}
             </ul>
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => runSimulation(jobs, stock)}
-            >
-              Re-simulate tools
-            </button>
+            <div className="row">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => runSimulation(jobs, stock)}
+              >
+                Re-simulate tools
+              </button>
+              <button
+                type="button"
+                disabled={!jobs[0]}
+                onClick={() => {
+                  const j = jobs.find((x) => x.enabled) ?? jobs[0];
+                  if (!j) return;
+                  downloadTextFile(j.name, j.source);
+                }}
+              >
+                Download current .nc
+              </button>
+            </div>
           </section>
 
           <FlatcamHelper
@@ -548,6 +630,9 @@ export default function App() {
             angleDeg={activeVbit?.angleDeg}
             cutDepthMm={activeVbit?.cutDepthMm}
             gcodeToolDiaMm={activeVbit?.gcodeToolDiaMm}
+            copperThicknessMm={stock.copperThickness}
+            hasActiveJob={Boolean(activeVbit || jobs[0])}
+            resetKey={helperResetKey}
             onApplyToTool={(tool) => {
               if (!activeVbit) return;
               const next = jobs.map((j) =>
@@ -556,6 +641,8 @@ export default function App() {
               setJobs(next);
               runSimulation(next, stock);
             }}
+            onRewriteAndResimulate={(req) => applyRewriteToActiveJob(req, false)}
+            onDownloadRewritten={(req) => applyRewriteToActiveJob(req, true)}
           />
 
           <section>
@@ -565,8 +652,7 @@ export default function App() {
                 [
                   ['width', 'Width'],
                   ['height', 'Height'],
-                  ['thickness', 'Thickness'],
-                  ['copperThickness', 'Copper'],
+                  ['thickness', 'Board thickness'],
                   ['originX', 'Origin X'],
                   ['originY', 'Origin Y'],
                   ['surfaceZ', 'Surface Z'],
@@ -576,17 +662,68 @@ export default function App() {
               ).map(([key, label]) => (
                 <label key={key}>
                   {label}
-                  <input
-                    type="number"
-                    step={key === 'resolution' ? 0.005 : 0.1}
+                  <NumberInput
+                    step={key === 'resolution' ? 0.001 : 0.1}
+                    min={0}
                     value={stock[key]}
-                    onChange={(e) =>
-                      setStock({ ...stock, [key]: parseFloat(e.target.value) || 0 })
-                    }
+                    onChange={(v) => setStock({ ...stock, [key]: v })}
                   />
                 </label>
               ))}
             </div>
+
+            <div className="copper-height">
+              <label>
+                Copper layer height (mm)
+                <NumberInput
+                  step={0.001}
+                  min={0.001}
+                  value={stock.copperThickness}
+                  onChange={(v) =>
+                    setStock({
+                      ...stock,
+                      copperThickness: Math.max(0.001, v),
+                    })
+                  }
+                />
+              </label>
+              <p className="muted tiny">
+                Default / standard ={' '}
+                <strong>{formatMm(STANDARD_COPPER_THICKNESS_MM)}</strong> (1 oz copper cladding)
+                {Math.abs(stock.copperThickness - STANDARD_COPPER_THICKNESS_MM) > 1e-6 && (
+                  <> · current differs from standard</>
+                )}
+              </p>
+              <div className="row">
+                {COPPER_THICKNESS_PRESETS.map((p) => (
+                  <button
+                    key={p.label}
+                    type="button"
+                    className={
+                      Math.abs(stock.copperThickness - p.mm) < 1e-6 ? 'primary' : ''
+                    }
+                    onClick={() => setStock({ ...stock, copperThickness: p.mm })}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setStock({
+                      ...stock,
+                      copperThickness: STANDARD_COPPER_THICKNESS_MM,
+                    })
+                  }
+                  disabled={
+                    Math.abs(stock.copperThickness - STANDARD_COPPER_THICKNESS_MM) < 1e-6
+                  }
+                >
+                  Reset to standard
+                </button>
+              </div>
+            </div>
+
             <label>
               Z convention
               <select
@@ -652,11 +789,11 @@ export default function App() {
                 checked={flipX}
                 onChange={(e) => setFlipX(e.target.checked)}
               />
-              Flip X direction
+              Flip X direction (on = correct)
             </label>
             <p className="muted tiny">
-              Red = X+, Green = Y+, Blue = Z+ (up). Origin is G-code (0,0,0). Use Flip X
-              if text/traces look mirrored.
+              Default view: X left→right, Y bottom→up (top plan). Red = X+, Green =
+              Y+, Blue = Z+ (out of board). Origin is G-code (0,0,0).
             </p>
             <button type="button" onClick={() => setResetViewKey((k) => k + 1)}>
               Reset view
@@ -682,7 +819,7 @@ export default function App() {
           {busy && (
             <div className="overlay">
               <div className="spinner" />
-              <p>Simulating… {(progress * 100).toFixed(0)}%</p>
+              <p>Simulating… {formatPct(progress)}</p>
             </div>
           )}
         </main>
@@ -693,24 +830,24 @@ export default function App() {
             <dl className="stats">
               <div>
                 <dt>X</dt>
-                <dd>{sim.x.toFixed(3)}</dd>
+                <dd>{formatMm(sim.x)}</dd>
               </div>
               <div>
                 <dt>Y</dt>
-                <dd>{sim.y.toFixed(3)}</dd>
+                <dd>{formatMm(sim.y)}</dd>
               </div>
               <div>
                 <dt>Z</dt>
-                <dd>{sim.z.toFixed(3)}</dd>
+                <dd>{formatMm(sim.z)}</dd>
               </div>
               <div>
                 <dt>F</dt>
-                <dd>{sim.feedrate.toFixed(1)}</dd>
+                <dd>{formatMmMin(sim.feedrate)}</dd>
               </div>
               <div>
                 <dt>Spindle</dt>
                 <dd>
-                  {sim.spindleOn ? `ON ${sim.spindleRpm}` : 'OFF'}
+                  {sim.spindleOn ? `ON ${formatNum(sim.spindleRpm)}` : 'OFF'}
                 </dd>
               </div>
               <div>
@@ -723,17 +860,17 @@ export default function App() {
               </div>
               <div>
                 <dt>Progress</dt>
-                <dd>{(sim.progress * 100).toFixed(1)}%</dd>
+                <dd>{formatPct(sim.progress)}</dd>
               </div>
             </dl>
             {expectedVbitWidth != null && (
               <p className="callout">
                 Effective groove (FlatCAM Tool Dia) ≈{' '}
-                <strong>{expectedVbitWidth.toFixed(3)} mm</strong>
+                <strong>{formatMm(expectedVbitWidth)}</strong>
                 {grooveWidth > 0 && (
                   <>
                     {' '}
-                    · simulated avg <strong>{grooveWidth.toFixed(3)} mm</strong>
+                    · simulated avg <strong>{formatMm(grooveWidth)}</strong>
                   </>
                 )}
                 <br />

@@ -1,12 +1,18 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { buildAxisGizmo, type AxisGizmo } from '../core/axisGizmo';
 import {
   buildBoardMesh,
+  buildComparisonRuler,
   buildToolMarker,
   buildToolpathLines,
 } from '../core/meshBuilder';
+import { formatNum } from '../core/format';
+import {
+  cssPixelsPerMm,
+  zoomPercentFromOrthoZoom,
+} from '../core/screenScale';
 import type { HeightFieldStock } from '../core/stock';
 import type { CameraMode, JobFile, Measurement, ViewMode } from '../core/types';
 
@@ -21,7 +27,6 @@ interface Props {
   onMeasureClick: (p: { x: number; y: number; z: number }) => void;
   measurements: Measurement[];
   resetViewKey: number;
-  /** When true, mirror board so G-code +X points the opposite world way */
   flipX?: boolean;
   showAxes?: boolean;
 }
@@ -33,6 +38,7 @@ type ViewerCtx = {
   controls: OrbitControls;
   boardDispose?: () => void;
   pathDispose?: () => void;
+  rulerDispose?: () => void;
   axes: AxisGizmo;
   tool: THREE.Group;
   measureGroup: THREE.Group;
@@ -42,7 +48,25 @@ type ViewerCtx = {
   boardRoot: THREE.Group;
   anim: number;
   framed: boolean;
+  planView: boolean;
+  flipX: boolean;
+  pxPerMm: number;
 };
+
+function applyTrueScaleOrtho(
+  cam: THREE.OrthographicCamera,
+  cssW: number,
+  cssH: number,
+  pxPerMm: number
+) {
+  const halfW = cssW / pxPerMm / 2;
+  const halfH = cssH / pxPerMm / 2;
+  cam.left = -halfW;
+  cam.right = halfW;
+  cam.top = halfH;
+  cam.bottom = -halfH;
+  cam.updateProjectionMatrix();
+}
 
 export function Viewer3D({
   stock,
@@ -55,17 +79,54 @@ export function Viewer3D({
   onMeasureClick,
   measurements,
   resetViewKey,
-  flipX = false,
+  flipX = true,
   showAxes = true,
 }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const ctxRef = useRef<ViewerCtx | null>(null);
+  const [zoomPct, setZoomPct] = useState(100);
+  const [scaleBarPx, setScaleBarPx] = useState(0);
+
+  const syncZoomHud = useCallback(() => {
+    const ctx = ctxRef.current;
+    const mount = mountRef.current;
+    if (!ctx || !mount) return;
+    if (ctx.camera instanceof THREE.OrthographicCamera) {
+      setZoomPct(zoomPercentFromOrthoZoom(ctx.camera.zoom));
+      // 10 mm scale bar at current zoom (CSS px)
+      setScaleBarPx(10 * ctx.pxPerMm * ctx.camera.zoom);
+    } else {
+      // Perspective: approximate vs a reference distance
+      const dist = ctx.camera.position.distanceTo(ctx.controls.target);
+      const ref = 80;
+      setZoomPct(Math.round((ref / Math.max(dist, 0.01)) * 1000) / 10);
+      setScaleBarPx(0);
+    }
+  }, []);
+
+  const goActualSize = useCallback(() => {
+    const ctx = ctxRef.current;
+    const mount = mountRef.current;
+    if (!ctx || !mount) return;
+    if (!(ctx.camera instanceof THREE.OrthographicCamera)) return;
+    applyTrueScaleOrtho(
+      ctx.camera,
+      mount.clientWidth,
+      Math.max(1, mount.clientHeight),
+      ctx.pxPerMm
+    );
+    ctx.camera.zoom = 1;
+    ctx.camera.updateProjectionMatrix();
+    ctx.controls.update();
+    syncZoomHud();
+  }, [syncZoomHud]);
 
   // Init Three.js once
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
 
+    const pxPerMm = cssPixelsPerMm();
     const scene = new THREE.Scene();
     scene.background = new THREE.Color('#0f1419');
 
@@ -109,7 +170,6 @@ export function Viewer3D({
     grid.position.y = -0.02;
     scene.add(grid);
 
-    // Board + toolpaths live under boardRoot so Flip X can mirror them together
     const boardRoot = new THREE.Group();
     boardRoot.name = 'board-root';
     scene.add(boardRoot);
@@ -142,6 +202,9 @@ export function Viewer3D({
       boardRoot,
       anim: 0,
       framed: false,
+      planView: true,
+      flipX: true,
+      pxPerMm,
     };
     ctxRef.current = ctx;
 
@@ -155,22 +218,32 @@ export function Viewer3D({
         cam.aspect = w / h;
         cam.updateProjectionMatrix();
       } else if (cam instanceof THREE.OrthographicCamera) {
-        const frustum = 40;
-        const aspect = w / h;
-        cam.left = (-frustum * aspect) / 2;
-        cam.right = (frustum * aspect) / 2;
-        cam.top = frustum / 2;
-        cam.bottom = -frustum / 2;
-        cam.updateProjectionMatrix();
+        applyTrueScaleOrtho(cam, w, h, ctxRef.current.pxPerMm);
       }
+      syncZoomHud();
     };
     window.addEventListener('resize', onResize);
+
+    const onControlsChange = () => syncZoomHud();
+    controls.addEventListener('change', onControlsChange);
 
     const tick = () => {
       const c = ctxRef.current;
       if (!c) return;
       c.anim = requestAnimationFrame(tick);
       c.controls.update();
+      if (c.planView) {
+        const t = c.controls.target;
+        const height = Math.max(10, c.camera.position.y);
+        c.camera.position.set(t.x, height, t.z);
+        c.camera.up.set(0, 0, 1);
+        const right = new THREE.Vector3(c.flipX ? -1 : 1, 0, 0);
+        const up = new THREE.Vector3(0, 0, 1);
+        const back = new THREE.Vector3(0, 1, 0);
+        c.camera.quaternion.setFromRotationMatrix(
+          new THREE.Matrix4().makeBasis(right, up, back)
+        );
+      }
       c.renderer.render(c.scene, c.camera);
     };
     tick();
@@ -178,73 +251,112 @@ export function Viewer3D({
     return () => {
       cancelAnimationFrame(ctx.anim);
       window.removeEventListener('resize', onResize);
+      controls.removeEventListener('change', onControlsChange);
       controls.dispose();
       axes.dispose();
       renderer.dispose();
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       ctxRef.current = null;
     };
-  }, []);
+  }, [syncZoomHud]);
 
-  const frameCamera = (s: HeightFieldStock, force = false) => {
+  const applyXyPlanOrientation = (
+    camera: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+    tx: number,
+    tz: number,
+    height: number
+  ) => {
+    camera.position.set(tx, height, tz);
+    camera.up.set(0, 0, 1);
+    const right = new THREE.Vector3(flipX ? -1 : 1, 0, 0);
+    const up = new THREE.Vector3(0, 0, 1);
+    const back = new THREE.Vector3(0, 1, 0);
+    const m = new THREE.Matrix4().makeBasis(right, up, back);
+    camera.quaternion.setFromRotationMatrix(m);
+    camera.updateMatrix();
+  };
+
+  const frameCamera = (s: HeightFieldStock, force = false, actualSize = false) => {
     const ctx = ctxRef.current;
-    if (!ctx) return;
+    const mount = mountRef.current;
+    if (!ctx || !mount) return;
     if (ctx.framed && !force) return;
     const cx = s.originX + s.widthMm / 2;
     const cz = s.originY + s.heightMm / 2;
     const span = Math.max(s.widthMm, s.heightMm);
-    // Target in world space (boardRoot may flip X)
     const sx = flipX ? -1 : 1;
-    ctx.controls.target.set(cx * sx, 0, cz);
+    const tx = cx * sx;
+    const tz = cz;
+    ctx.controls.target.set(tx, 0, tz);
+    const height = Math.max(40, span * 1.5);
+
     if (ctx.camera instanceof THREE.PerspectiveCamera) {
-      const dist = Math.max(25, span * 1.1);
-      ctx.camera.position.set(cx * sx + dist * 0.55 * sx, dist * 0.7, cz + dist * 0.55);
+      applyXyPlanOrientation(ctx.camera, tx, tz - span * 0.02, height);
       ctx.camera.near = 0.01;
-      ctx.camera.far = Math.max(5000, dist * 20);
+      ctx.camera.far = Math.max(5000, height * 20);
       ctx.camera.updateProjectionMatrix();
     } else {
-      ctx.camera.position.set(cx * sx, 80, cz);
+      applyXyPlanOrientation(ctx.camera, tx, tz, height);
+      applyTrueScaleOrtho(
+        ctx.camera,
+        mount.clientWidth,
+        Math.max(1, mount.clientHeight),
+        ctx.pxPerMm
+      );
+      if (actualSize) {
+        ctx.camera.zoom = 1;
+      } else {
+        // Fit board + 2 cm comparison ruler (above +Y edge) while keeping true-scale frustum
+        const viewW = mount.clientWidth / ctx.pxPerMm;
+        const viewH = Math.max(1, mount.clientHeight) / ctx.pxPerMm;
+        // Padding for 2 cm ruler (top) + W/H dimension lines (bottom/left)
+        const fitW = s.widthMm + 14;
+        const fitH = s.heightMm + 16;
+        const fit = Math.min(viewW / Math.max(fitW, 0.01), viewH / Math.max(fitH, 0.01));
+        ctx.camera.zoom = Math.max(0.05, fit * 0.88);
+      }
+      ctx.camera.updateProjectionMatrix();
     }
     ctx.controls.update();
     ctx.framed = true;
+    syncZoomHud();
   };
 
-  // Flip X / show axes
   useEffect(() => {
     const ctx = ctxRef.current;
     if (!ctx) return;
+    ctx.flipX = flipX;
     ctx.boardRoot.scale.x = flipX ? -1 : 1;
-    // Rebuild axis gizmo so arrow label matches flip
     ctx.scene.remove(ctx.axes.group);
     ctx.axes.dispose();
     const len = stock
       ? Math.max(8, Math.min(20, Math.max(stock.widthMm, stock.heightMm) * 0.22))
       : 12;
     ctx.axes = buildAxisGizmo(len, flipX);
-    // Keep gizmo at machine origin (0,0,0) so +X/+Y/+Z match G-code
     ctx.axes.setOrigin(0, 0, 0);
     ctx.axes.group.visible = showAxes;
     ctx.scene.add(ctx.axes.group);
     if (stock) {
       ctx.framed = false;
-      frameCamera(stock, true);
+      frameCamera(stock, true, false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flipX, showAxes, stock?.widthMm, stock?.heightMm]);
 
-  // Rebuild board / toolpaths when data changes
   useEffect(() => {
     const ctx = ctxRef.current;
     if (!ctx) return;
 
     ctx.boardDispose?.();
     ctx.pathDispose?.();
+    ctx.rulerDispose?.();
     ctx.boardDispose = undefined;
     ctx.pathDispose = undefined;
+    ctx.rulerDispose = undefined;
     ctx.boardMesh = null;
 
     const toRemove = ctx.boardRoot.children.filter(
-      (c) => c.name === 'pcb' || c.name === 'toolpaths'
+      (c) => c.name === 'pcb' || c.name === 'toolpaths' || c.name === 'comparison-ruler'
     );
     for (const c of toRemove) ctx.boardRoot.remove(c);
 
@@ -259,7 +371,13 @@ export function Viewer3D({
       const len = Math.max(8, Math.min(20, Math.max(stock.widthMm, stock.heightMm) * 0.22));
       ctx.axes.setLength(len);
       ctx.axes.setOrigin(0, 0, 0);
-      frameCamera(stock, false);
+      frameCamera(stock, false, false);
+    }
+
+    if (stock) {
+      const ruler = buildComparisonRuler(stock);
+      ctx.boardRoot.add(ruler.group);
+      ctx.rulerDispose = ruler.dispose;
     }
 
     if (showPaths) {
@@ -267,9 +385,9 @@ export function Viewer3D({
       ctx.boardRoot.add(paths.group);
       ctx.pathDispose = paths.dispose;
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stock, jobs, viewMode]);
 
-  // Camera mode
   useEffect(() => {
     const ctx = ctxRef.current;
     const mount = mountRef.current;
@@ -281,52 +399,57 @@ export function Viewer3D({
     ctx.controls.dispose();
 
     if (cameraMode === 'top') {
-      const frustum = Math.max(30, (stock?.widthMm ?? 40) * 0.9);
-      const aspect = w / h;
-      const ortho = new THREE.OrthographicCamera(
-        (-frustum * aspect) / 2,
-        (frustum * aspect) / 2,
-        frustum / 2,
-        -frustum / 2,
-        0.01,
-        5000
-      );
-      ortho.position.set(target.x, 80, target.z);
-      ortho.up.set(0, 0, -1);
-      ortho.lookAt(target);
+      const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 5000);
+      applyTrueScaleOrtho(ortho, w, h, ctx.pxPerMm);
+      ortho.zoom = 1;
+      applyXyPlanOrientation(ortho, target.x, target.z, 100);
       ctx.camera = ortho;
       const controls = new OrbitControls(ortho, ctx.renderer.domElement);
       controls.enableDamping = true;
       controls.enableRotate = false;
       controls.screenSpacePanning = true;
-      controls.target.copy(target);
+      controls.target.set(target.x, 0, target.z);
+      controls.addEventListener('change', syncZoomHud);
       ctx.controls = controls;
+      ctx.planView = true;
     } else {
       const persp = new THREE.PerspectiveCamera(45, w / h, 0.01, 5000);
-      persp.position.set(target.x + 35, 45, target.z + 40);
-      persp.lookAt(target);
+      applyXyPlanOrientation(
+        persp,
+        target.x,
+        target.z - 2,
+        Math.max(50, (stock?.widthMm ?? 40) * 1.2)
+      );
       ctx.camera = persp;
       const controls = new OrbitControls(persp, ctx.renderer.domElement);
       controls.enableDamping = true;
       controls.enableRotate = true;
       controls.screenSpacePanning = true;
-      controls.target.copy(target);
+      controls.target.set(target.x, 0, target.z);
+      controls.addEventListener('change', syncZoomHud);
       ctx.controls = controls;
+      ctx.planView = false;
     }
+    ctx.flipX = flipX;
     ctx.controls.update();
-  }, [cameraMode]);
+    if (stock) {
+      ctx.framed = false;
+      frameCamera(stock, true, false);
+    } else {
+      syncZoomHud();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraMode, flipX, stock]);
 
-  // Explicit Reset View button
   useEffect(() => {
     if (!stock || resetViewKey === 0) return;
     const ctx = ctxRef.current;
     if (!ctx) return;
     ctx.framed = false;
-    frameCamera(stock, true);
+    frameCamera(stock, true, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resetViewKey]);
 
-  // Tool marker
   useEffect(() => {
     const ctx = ctxRef.current;
     if (!ctx) return;
@@ -338,7 +461,6 @@ export function Viewer3D({
     ctx.tool.position.set(toolPos.x, toolPos.z + 0.6, toolPos.y);
   }, [toolPos]);
 
-  // Measurements visuals
   useEffect(() => {
     const ctx = ctxRef.current;
     if (!ctx) return;
@@ -369,7 +491,6 @@ export function Viewer3D({
     }
   }, [measurePoints, measurements]);
 
-  // Click to measure (do not steal drag from OrbitControls)
   useEffect(() => {
     const ctx = ctxRef.current;
     const mount = mountRef.current;
@@ -401,10 +522,36 @@ export function Viewer3D({
     };
   }, [measureMode, onMeasureClick]);
 
+  const isTop = cameraMode === 'top';
+
   return (
     <div
       ref={mountRef}
       className={`viewer3d ${measureMode ? 'measure-cursor' : ''}`}
-    />
+    >
+      <div className="zoom-hud">
+        <div className="zoom-hud-main">
+          <span className="zoom-pct">Zoom {formatNum(zoomPct, 1)}%</span>
+          {isTop && Math.abs(zoomPct - 100) < 0.15 ? (
+            <span className="zoom-actual">1:1 actual size</span>
+          ) : isTop ? (
+            <span className="zoom-hint">Top view · scroll to zoom</span>
+          ) : (
+            <span className="zoom-hint">1:1 only in Top view</span>
+          )}
+        </div>
+        {isTop && (
+          <button type="button" className="zoom-actual-btn" onClick={goActualSize}>
+            100% actual size
+          </button>
+        )}
+        {isTop && scaleBarPx > 8 && (
+          <div className="scale-bar" title="10 mm at current zoom (CSS 96dpi)">
+            <div className="scale-bar-line" style={{ width: `${Math.min(scaleBarPx, 240)}px` }} />
+            <span>10 mm</span>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

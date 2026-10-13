@@ -104,15 +104,46 @@ button.icon {
 
 .workspace {
   display: grid;
-  grid-template-columns: 280px 1fr 280px;
+  grid-template-columns: minmax(340px, 22vw) 1fr minmax(280px, 18vw);
   min-height: 0;
 }
 
 .panel {
   background: var(--panel);
   border-right: 1px solid var(--border);
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 0.75rem;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.panel.left {
+  width: 100%;
+  max-width: 100%;
+}
+
+.panel.left * {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.panel.left input,
+.panel.left select,
+.panel.left button {
+  max-width: 100%;
+}
+
+.panel.left .row {
+  max-width: 100%;
+}
+
+.panel.left .formula,
+.panel.left .callout,
+.panel.left .helper-summary,
+.panel.left .tool-eff {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .panel.right {
@@ -160,6 +191,8 @@ label {
 label input,
 label select {
   color: var(--text);
+  width: 100%;
+  min-width: 0;
 }
 
 .row {
@@ -183,10 +216,13 @@ label select {
   align-items: center;
   gap: 0.4rem;
   margin: 0;
+  min-width: 0;
+  width: 100%;
 }
 
 .job-name {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -284,6 +320,60 @@ label select {
   margin: 0.5rem 0 0;
 }
 
+.cut-z-neg {
+  color: #fbbf24 !important;
+}
+
+.copper-remain-warn {
+  grid-column: 1 / -1;
+  margin: 0.35rem 0 0;
+  padding: 0.45rem 0.5rem;
+  border-radius: 0.25rem;
+  border: 1px solid #b91c1c;
+  background: #3f1212;
+  color: #fecaca;
+  font-size: 0.75rem;
+  line-height: 1.35;
+}
+
+.copper-remain-warn strong {
+  color: #f87171;
+  font-family: var(--mono);
+}
+
+.rewrite-actions {
+  margin-top: 0.55rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--border);
+}
+
+.warn-inline {
+  margin: 0 0 0.4rem;
+  font-size: 0.72rem;
+  color: var(--warn);
+}
+
+.copper-height {
+  margin: 0.55rem 0 0.65rem;
+  padding: 0.5rem 0.55rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+}
+
+.copper-height > label {
+  margin-bottom: 0.25rem;
+}
+
+.copper-height .row {
+  margin-top: 0.35rem;
+}
+
+.copper-height .row button {
+  font-size: 0.72rem;
+  padding: 0.3rem 0.45rem;
+}
+
 .center {
   position: relative;
   min-width: 0;
@@ -316,6 +406,78 @@ label select {
   width: 100% !important;
   height: 100% !important;
   outline: none;
+}
+
+.zoom-hud {
+  position: absolute;
+  left: 0.65rem;
+  bottom: 0.65rem;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  pointer-events: none;
+  font-size: 0.72rem;
+  color: #e2e8f0;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+}
+
+.zoom-hud-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.45rem;
+}
+
+.zoom-pct {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.zoom-actual {
+  color: #86efac;
+  font-weight: 500;
+}
+
+.zoom-hint {
+  color: #94a3b8;
+  font-size: 0.68rem;
+}
+
+.zoom-actual-btn {
+  pointer-events: auto;
+  align-self: flex-start;
+  border: 1px solid #334155;
+  background: rgba(15, 23, 42, 0.85);
+  color: #e2e8f0;
+  border-radius: 4px;
+  padding: 0.22rem 0.5rem;
+  font-size: 0.68rem;
+  cursor: pointer;
+}
+
+.zoom-actual-btn:hover {
+  border-color: #64748b;
+  background: rgba(30, 41, 59, 0.95);
+}
+
+.scale-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.1rem;
+  color: #cbd5e1;
+}
+
+.scale-bar-line {
+  height: 0;
+  border-top: 2px solid #e2e8f0;
+  border-left: 2px solid #e2e8f0;
+  border-right: 2px solid #e2e8f0;
+  box-sizing: border-box;
+  min-width: 8px;
+  max-width: 240px;
 }
 
 .check-row {
@@ -481,7 +643,7 @@ label select {
 
 @media (max-width: 1100px) {
   .workspace {
-    grid-template-columns: 240px 1fr;
+    grid-template-columns: minmax(300px, 32vw) 1fr;
   }
   .panel.right {
     display: none;

@@ -1,3 +1,4 @@
+import { formatMm, formatMmMin, formatNum } from './format';
 import { cutDepthAtZ, resolveZConvention } from './gcodeParser';
 import type { JobFile, StockSettings, ValidationWarning } from './types';
 
@@ -39,7 +40,7 @@ export function validateJobs(jobs: JobFile[], stock: StockSettings): ValidationW
             warnings.push({
               severity: 'warning',
               code: 'outside-stock',
-              message: `${job.name}: cutting outside stock near X${x.toFixed(3)} Y${y.toFixed(3)}`,
+              message: `${job.name}: cutting outside stock near X${formatNum(x)} Y${formatNum(y)}`,
               lineNumber: seg.lineNumber,
             });
             break;
@@ -49,7 +50,7 @@ export function validateJobs(jobs: JobFile[], stock: StockSettings): ValidationW
           warnings.push({
             severity: 'info',
             code: 'negative-xy',
-            message: `${job.name}: unexpected negative X/Y (X${x.toFixed(3)}, Y${y.toFixed(3)})`,
+            message: `${job.name}: unexpected negative X/Y (X${formatNum(x)}, Y${formatNum(y)})`,
             lineNumber: seg.lineNumber,
           });
         }
@@ -92,7 +93,7 @@ export function validateJobs(jobs: JobFile[], stock: StockSettings): ValidationW
       warnings.push({
         severity: 'warning',
         code: 'too-deep',
-        message: `${job.name}: cut depth ${maxDepth.toFixed(3)} mm exceeds board thickness ${stock.thickness} mm`,
+        message: `${job.name}: cut depth ${formatMm(maxDepth)} exceeds board thickness ${formatMm(stock.thickness)}`,
       });
     }
 
@@ -100,7 +101,7 @@ export function validateJobs(jobs: JobFile[], stock: StockSettings): ValidationW
       warnings.push({
         severity: 'warning',
         code: 'plunge-feed',
-        message: `${job.name}: plunge feed appears excessive (${maxFeedZ.toFixed(0)} mm/min)`,
+        message: `${job.name}: plunge feed appears excessive (${formatMmMin(maxFeedZ)})`,
       });
     }
 
@@ -108,7 +109,7 @@ export function validateJobs(jobs: JobFile[], stock: StockSettings): ValidationW
       warnings.push({
         severity: 'info',
         code: 'large-vbit',
-        message: `${job.name}: V-bit tip ${job.tool.tipDiameter} mm may be large for fine isolation`,
+        message: `${job.name}: V-bit tip ${formatMm(job.tool.tipDiameter)} may be large for fine isolation`,
       });
     }
   }

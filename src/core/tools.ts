@@ -1,5 +1,6 @@
 import type { Tool } from './types';
 import { tipWidthFromFlatcamToolDia } from './flatcamHelper';
+import { formatDeg, formatMm, roundMm } from './format';
 
 /**
  * V-bit effective cutting diameter at a given depth below the stock surface.
@@ -37,11 +38,11 @@ export function toolRadiusAtDepth(tool: Tool, depth: number): number {
 export function toolLabel(tool: Tool): string {
   switch (tool.type) {
     case 'vbit':
-      return `V-bit ${tool.angle}° tip ${tool.tipDiameter} mm`;
+      return `V-bit ${formatDeg(tool.angle)} tip ${formatMm(tool.tipDiameter)}`;
     case 'endmill':
-      return `End mill Ø${tool.diameter} mm`;
+      return `End mill Ø${formatMm(tool.diameter)}`;
     case 'drill':
-      return `Drill Ø${tool.diameter} mm`;
+      return `Drill Ø${formatMm(tool.diameter)}`;
   }
 }
 
@@ -78,8 +79,8 @@ export function guessToolFromMetadata(
 
   return {
     type: 'vbit',
-    tipDiameter,
-    angle: defaultAngle,
+    tipDiameter: roundMm(tipDiameter),
+    angle: roundMm(defaultAngle),
     shankDiameter: 3.175,
   };
 }

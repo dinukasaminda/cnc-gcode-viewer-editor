@@ -1,3 +1,4 @@
+import { roundMm } from './format';
 import { vbitEffectiveDiameter } from './tools';
 
 /**
@@ -29,16 +30,16 @@ export interface FlatcamVBitResult {
 }
 
 export function calcFlatcamToolDia(inputs: FlatcamVBitInputs): FlatcamVBitResult {
-  const tipWidthMm = Math.max(0, inputs.tipWidthMm);
-  const angleDeg = Math.max(0, inputs.angleDeg);
-  const cutDepthMm = Math.max(0, inputs.cutDepthMm);
-  const flatcamToolDiaMm = vbitEffectiveDiameter(tipWidthMm, angleDeg, cutDepthMm);
+  const tipWidthMm = roundMm(Math.max(0, inputs.tipWidthMm));
+  const angleDeg = roundMm(Math.max(0, inputs.angleDeg));
+  const cutDepthMm = roundMm(Math.max(0, inputs.cutDepthMm));
+  const flatcamToolDiaMm = roundMm(vbitEffectiveDiameter(tipWidthMm, angleDeg, cutDepthMm));
   return {
     tipWidthMm,
     angleDeg,
     cutDepthMm,
     flatcamToolDiaMm,
-    flareMm: Math.max(0, flatcamToolDiaMm - tipWidthMm),
+    flareMm: roundMm(Math.max(0, flatcamToolDiaMm - tipWidthMm)),
   };
 }
 
@@ -53,7 +54,31 @@ export function tipWidthFromFlatcamToolDia(
 ): number {
   const half = ((Math.max(0, angleDeg) / 2) * Math.PI) / 180;
   const flare = 2 * Math.max(0, cutDepthMm) * Math.tan(half);
-  return Math.max(0, flatcamToolDiaMm - flare);
+  return roundMm(Math.max(0, flatcamToolDiaMm - flare));
+}
+
+/**
+ * Solve for |Cut Z| given desired FlatCAM Tool Dia:
+ *   |Cut Z| = (ToolDia − tip) / (2 × tan(angle/2))
+ */
+export function cutDepthFromToolDia(
+  flatcamToolDiaMm: number,
+  tipWidthMm: number,
+  angleDeg: number
+): number {
+  const half = ((Math.max(0, angleDeg) / 2) * Math.PI) / 180;
+  const tanHalf = Math.tan(half);
+  if (tanHalf < 1e-12) return 0;
+  return roundMm(Math.max(0, (flatcamToolDiaMm - tipWidthMm) / (2 * tanHalf)));
+}
+
+/** Signed Cut Z for CNC (negative = below surface). */
+export function negativeCutZFromToolDia(
+  flatcamToolDiaMm: number,
+  tipWidthMm: number,
+  angleDeg: number
+): number {
+  return roundMm(-cutDepthFromToolDia(flatcamToolDiaMm, tipWidthMm, angleDeg));
 }
 
 export const FLATCAM_HELPER_COPY = {
