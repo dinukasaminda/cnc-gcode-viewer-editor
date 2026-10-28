@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { MeshViewer3D, type PartClickEvent } from '../components/MeshViewer3D';
+import {
+  MeshViewer3D,
+  type MeasureMode,
+  type MeasurePoint,
+  type PartClickEvent,
+  type SurfaceHitEvent,
+} from '../components/MeshViewer3D';
 import { NumberInput } from '../components/NumberInput';
 import { removeSmallComponents, simplifyMesh } from '../core/meshSimplify';
 import { formatNum } from '../core/format';
@@ -12,6 +18,7 @@ import {
   nextPaletteColor,
   remapGroupsAfterReplace,
   resolvePartColor,
+  scalePartsUniform,
   scrubGroups,
   splitConnectedComponents,
   totalStats,
@@ -26,12 +33,29 @@ import {
   load3mfFromUrl,
   suggested3mfName,
 } from '../core/threemf';
+import {
+  PRINT_CONFIG_URL,
+  buildEstimateGcode,
+  downloadText,
+  estimatePrintFromConfig,
+  loadPrintConfig,
+  type PrintConfig,
+  type PrintEstimate,
+} from '../core/printEstimate';
 import '../App.css';
 
 const MAX_HISTORY = 16;
 
 function formatCount(n: number): string {
   return Math.round(n).toLocaleString();
+}
+
+function formatPrintDelta(seconds: number): string {
+  const s = Math.round(seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  return `${Math.max(1, m)}m`;
 }
 
 function newId() {
@@ -48,6 +72,9 @@ interface HistoryEntry {
   groups: PartGroup[];
   triangleCount: number;
   vertexCount: number;
+  /** Present only after "Slice → G-code estimate" on this step. */
+  printEstimate?: PrintEstimate | null;
+  gcodeEstimate?: string | null;
 }
 
 function geometriesIn(entries: HistoryEntry[]): Set<import('three').BufferGeometry> {
@@ -78,13 +105,16 @@ function formatTime(at: number): string {
 }
 
 function entryFromParts(
-  partial: Omit<HistoryEntry, 'triangleCount' | 'vertexCount' | 'parts' | 'groups'> & {
+  partial: Omit<
+    HistoryEntry,
+    'triangleCount' | 'vertexCount' | 'parts' | 'groups' | 'printEstimate' | 'gcodeEstimate'
+  > & {
     parts: MeshPart[];
     groups: PartGroup[];
   }
 ): HistoryEntry {
   const stats = totalStats(partial.parts);
-  return { ...partial, ...stats };
+  return { ...partial, ...stats, printEstimate: null, gcodeEstimate: null };
 }
 
 export default function ModelSimplifier() {
@@ -101,6 +131,16 @@ export default function ModelSimplifier() {
   const [wireframe, setWireframe] = useState(false);
   const [resetKey, setResetKey] = useState(0);
   const [confirmDeleteLatest, setConfirmDeleteLatest] = useState(false);
+  const [printConfig, setPrintConfig] = useState<PrintConfig | null>(null);
+  const [dockTab, setDockTab] = useState<'estimate' | 'size' | 'params'>('estimate');
+  const [measureMode, setMeasureMode] = useState<MeasureMode>('off');
+  const [measurePoints, setMeasurePoints] = useState<MeasurePoint[]>([]);
+  const [knownSizeMm, setKnownSizeMm] = useState(350);
+  const [paramNozzle, setParamNozzle] = useState(0.2);
+  const [paramLayer, setParamLayer] = useState(0.1);
+  const [paramWalls, setParamWalls] = useState(4);
+  const [paramInfill, setParamInfill] = useState(15);
+  const [paramTimeScale, setParamTimeScale] = useState(0.4951);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const autoLoaded = useRef(false);
   const timelineRef = useRef<HTMLUListElement>(null);
@@ -172,7 +212,11 @@ export default function ModelSimplifier() {
       setHistoryIndex(index);
       setSelectedIds([]);
       setActiveGroupId(null);
-      setStatus(`Restored “${entry.label}” · ${formatCount(entry.triangleCount)} tris`);
+      setDockTab('estimate');
+      setStatus(
+        `Restored “${entry.label}” · ${formatCount(entry.triangleCount)} tris` +
+          (entry.printEstimate ? ` · sliced ${entry.printEstimate.label}` : '')
+      );
     },
     [busy, history, historyIndex]
   );
@@ -248,6 +292,66 @@ export default function ModelSimplifier() {
     void loadDefault();
   }, [loadDefault]);
 
+  useEffect(() => {
+    loadPrintConfig()
+      .then((cfg) => {
+        setPrintConfig(cfg);
+        setParamNozzle(cfg.nozzle.diameterMm);
+        setParamLayer(cfg.layer.layerHeightMm);
+        setParamWalls(cfg.shell.wallLoops);
+        setParamInfill(cfg.infill.densityPercent);
+        setParamTimeScale(cfg.timeModel.scaleFactor);
+        if (cfg.calibration?.referenceDiameterMm) {
+          setKnownSizeMm(cfg.calibration.referenceDiameterMm);
+        }
+      })
+      .catch((err) =>
+        setStatus(`Print config load failed: ${err instanceof Error ? err.message : String(err)}`)
+      );
+  }, []);
+
+  const measuredLength = useMemo(() => {
+    if (measurePoints.length < 2) return 0;
+    const a = measurePoints[0];
+    const b = measurePoints[1];
+    return Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+  }, [measurePoints]);
+
+  /** For radius mode, measured value is radius (center→rim). Line mode = full length. */
+  const measuredFeatureMm = useMemo(() => {
+    if (measuredLength <= 0) return 0;
+    return measureMode === 'radius' ? measuredLength : measuredLength;
+  }, [measuredLength, measureMode]);
+
+  const pendingSizeScale = useMemo(() => {
+    if (measuredFeatureMm <= 1e-9 || knownSizeMm <= 0) return 1;
+    // radius mode: knownSize is diameter or radius? UI labels diameter for moon → if radius mode, known is radius
+    return knownSizeMm / measuredFeatureMm;
+  }, [measuredFeatureMm, knownSizeMm]);
+
+  const activePrintConfig = useMemo((): PrintConfig | null => {
+    if (!printConfig) return null;
+    return {
+      ...printConfig,
+      nozzle: {
+        ...printConfig.nozzle,
+        diameterMm: paramNozzle,
+        lineWidthMm: Math.max(paramNozzle * 1.1, 0.01),
+      },
+      layer: { ...printConfig.layer, layerHeightMm: paramLayer },
+      shell: { ...printConfig.shell, wallLoops: paramWalls },
+      infill: { ...printConfig.infill, densityPercent: paramInfill },
+      timeModel: { ...printConfig.timeModel, scaleFactor: paramTimeScale },
+    };
+  }, [printConfig, paramNozzle, paramLayer, paramWalls, paramInfill, paramTimeScale]);
+
+  const liveEstimate = useMemo(() => {
+    if (!model || !activePrintConfig) return null;
+    const scale =
+      measurePoints.length >= 2 && Math.abs(pendingSizeScale - 1) > 1e-9 ? pendingSizeScale : 1;
+    return estimatePrintFromConfig(model.parts, activePrintConfig, scale);
+  }, [model, activePrintConfig, measurePoints.length, pendingSizeScale]);
+
   const onFiles = async (files: FileList | null) => {
     const file = files?.[0];
     if (!file) return;
@@ -266,7 +370,7 @@ export default function ModelSimplifier() {
   };
 
   const onPartClick = useCallback((ev: PartClickEvent) => {
-    if (busy) return;
+    if (busy || measureMode !== 'off') return;
     setActiveGroupId(null);
     setSelectedIds((prev) => {
       const multi = ev.shiftKey || ev.metaKey || ev.ctrlKey;
@@ -276,12 +380,63 @@ export default function ModelSimplifier() {
           ? prev.filter((id) => id !== ev.partId)
           : [...prev, ev.partId];
       }
-      // Plain click toggles for easy multi-pick; second click on same clears
       if (prev.length === 1 && prev[0] === ev.partId) return [];
       if (prev.includes(ev.partId)) return prev.filter((id) => id !== ev.partId);
       return [...prev, ev.partId];
     });
-  }, [busy]);
+  }, [busy, measureMode]);
+
+  const onSurfaceHit = useCallback(
+    (ev: SurfaceHitEvent) => {
+      if (busy || measureMode === 'off') return;
+      setMeasurePoints((prev) => {
+        const next = [...prev, ev.point];
+        if (next.length > 2) return [ev.point];
+        return next;
+      });
+      setDockTab('size');
+    },
+    [busy, measureMode]
+  );
+
+  const clearMeasure = () => setMeasurePoints([]);
+
+  const startMeasure = (mode: 'line' | 'radius') => {
+    setMeasureMode(mode);
+    setMeasurePoints([]);
+    setDockTab('size');
+    setStatus(
+      mode === 'line'
+        ? 'Size: click two points for a straight reference on the model.'
+        : 'Size: click center, then a rim point for radius.'
+    );
+  };
+
+  const applyMeasuredSize = () => {
+    if (!model || measurePoints.length < 2 || measuredFeatureMm <= 1e-9) return;
+    const scale = knownSizeMm / measuredFeatureMm;
+    if (!Number.isFinite(scale) || scale <= 0) return;
+    const scaled = scalePartsUniform(model.parts, scale);
+    commitEntry(
+      entryFromParts({
+        id: newId(),
+        label: `Set size · ${formatNum(knownSizeMm)} mm`,
+        detail:
+          measureMode === 'radius'
+            ? `Radius ${formatNum(measuredFeatureMm)} → ${formatNum(knownSizeMm)} mm (×${formatNum(scale)})`
+            : `Length ${formatNum(measuredFeatureMm)} → ${formatNum(knownSizeMm)} mm (×${formatNum(scale)})`,
+        at: Date.now(),
+        name: model.name,
+        parts: scaled,
+        groups: cloneGroups(model.groups),
+      })
+    );
+    setMeasureMode('off');
+    setMeasurePoints([]);
+    setStatus(
+      `Applied size scale ×${formatNum(scale)} · reference now ${formatNum(knownSizeMm)} mm`
+    );
+  };
 
   const selectPartFromList = (partId: string, additive: boolean) => {
     setActiveGroupId(null);
@@ -525,6 +680,45 @@ export default function ModelSimplifier() {
     }
   };
 
+  /** 3MF ≠ printable — synthesize estimated G-code + time from config JSON. */
+  const sliceToGcodeEstimate = async (alsoDownload: boolean) => {
+    if (!model || busy) return;
+    setBusy(true);
+    setStatus('Slicing estimate → G-code (config profile)…');
+    try {
+      await new Promise((r) => setTimeout(r, 30));
+      const cfg = activePrintConfig ?? printConfig ?? (await loadPrintConfig());
+      if (!printConfig) setPrintConfig(cfg);
+      const pending =
+        measurePoints.length >= 2 && Math.abs(pendingSizeScale - 1) > 1e-9 ? pendingSizeScale : 1;
+      const estimate = estimatePrintFromConfig(model.parts, cfg, pending);
+      const gcode = buildEstimateGcode(estimate, cfg, model.name);
+      setHistory((prev) => {
+        if (historyIndex < 0 || historyIndex >= prev.length) return prev;
+        const next = [...prev];
+        next[historyIndex] = {
+          ...next[historyIndex],
+          printEstimate: estimate,
+          gcodeEstimate: gcode,
+        };
+        return next;
+      });
+      if (alsoDownload) {
+        const base = model.name.replace(/\.3mf$/i, '') || 'model';
+        downloadText(`${base}_a1mini_estimate.gcode`, gcode, 'text/x-gcode');
+      }
+      setDockTab('estimate');
+      setStatus(
+        `A1 Mini estimate ${estimate.label} (${estimate.hours.toFixed(2)} h) · scale×${estimate.scaleFactor}` +
+          (alsoDownload ? ' · G-code downloaded' : '')
+      );
+    } catch (err) {
+      setStatus(`Estimate error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const scopeHint =
     activeGroup
       ? `Scope: ${activeGroup.name} (${activeGroup.partIds.length} parts)`
@@ -591,6 +785,20 @@ export default function ModelSimplifier() {
               <p className="muted">No model loaded</p>
             )}
             <p className="muted tiny scope-hint">{scopeHint}</p>
+          </section>
+
+          <section>
+            <h2>Print / size</h2>
+            <p className="muted tiny">
+              Use the <strong>bottom window</strong> under the 3D view: Estimate · Size · Parameters.
+              Measure a line/radius to set real size, then slice to G-code.
+            </p>
+            <button type="button" className="wide" onClick={() => setDockTab('estimate')}>
+              Focus estimate window
+            </button>
+            <button type="button" className="wide" onClick={() => startMeasure('radius')}>
+              Measure radius (set size)
+            </button>
           </section>
 
           <section>
@@ -785,14 +993,233 @@ export default function ModelSimplifier() {
         </aside>
 
         <main className="viewport-wrap">
-          <MeshViewer3D
-            parts={viewerParts}
-            wireframe={wireframe}
-            resetKey={resetKey}
-            pickEnabled={!busy}
-            onPartClick={onPartClick}
-          />
-          {busy && <div className="viewport-busy">Working…</div>}
+          <div className="viewport-stage">
+            <MeshViewer3D
+              parts={viewerParts}
+              wireframe={wireframe}
+              resetKey={resetKey}
+              pickEnabled={!busy}
+              measureMode={measureMode}
+              measurePoints={measurePoints}
+              onPartClick={onPartClick}
+              onSurfaceHit={onSurfaceHit}
+            />
+            {busy && <div className="viewport-busy">Working…</div>}
+            {measureMode !== 'off' && (
+              <div className="measure-banner">
+                Measuring {measureMode === 'line' ? 'line' : 'radius'} — click model (
+                {measurePoints.length}/2) · RMB orbit · LMB drag pan
+              </div>
+            )}
+          </div>
+
+          <div className="estimate-dock">
+            <div className="estimate-dock-tabs" role="tablist">
+              <button
+                type="button"
+                role="tab"
+                className={dockTab === 'estimate' ? 'active' : ''}
+                onClick={() => setDockTab('estimate')}
+              >
+                Estimate
+              </button>
+              <button
+                type="button"
+                role="tab"
+                className={dockTab === 'size' ? 'active' : ''}
+                onClick={() => setDockTab('size')}
+              >
+                Size
+              </button>
+              <button
+                type="button"
+                role="tab"
+                className={dockTab === 'params' ? 'active' : ''}
+                onClick={() => setDockTab('params')}
+              >
+                Parameters
+              </button>
+            </div>
+
+            <div className="estimate-dock-body">
+              {dockTab === 'estimate' && (
+                <div className="dock-pane dock-estimate">
+                  <div className="dock-estimate-main">
+                    <div className="dock-time mono">
+                      {liveEstimate?.label ?? model?.printEstimate?.label ?? '—'}
+                    </div>
+                    <div className="muted tiny">
+                      {liveEstimate
+                        ? `${liveEstimate.printerName} · ${liveEstimate.hours.toFixed(2)} h · ${formatCount(liveEstimate.layers)} layers`
+                        : 'Load a model / set size to see live time'}
+                    </div>
+                    {measurePoints.length >= 2 && Math.abs(pendingSizeScale - 1) > 1e-6 && (
+                      <div className="muted tiny">
+                        Includes pending size ×{formatNum(pendingSizeScale)} (apply on Size tab)
+                      </div>
+                    )}
+                  </div>
+                  <div className="dock-estimate-meta">
+                    <dl className="kv compact">
+                      <dt>History</dt>
+                      <dd className="mono">
+                        {historyIndex + 1}/{history.length}
+                      </dd>
+                      <dt>Mesh vol</dt>
+                      <dd className="mono">
+                        {liveEstimate ? `${formatNum(liveEstimate.volumeMm3)} mm³` : '—'}
+                      </dd>
+                      <dt>Filament</dt>
+                      <dd className="mono">
+                        {liveEstimate ? `${formatNum(liveEstimate.filamentMeters)} m` : '—'}
+                      </dd>
+                      <dt>Sliced</dt>
+                      <dd className="mono">{model?.printEstimate?.label ?? 'not sliced'}</dd>
+                    </dl>
+                    <div className="row-actions">
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={!model || busy}
+                        onClick={() => void sliceToGcodeEstimate(false)}
+                      >
+                        Slice → G-code
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!model || busy}
+                        onClick={() => void sliceToGcodeEstimate(true)}
+                      >
+                        Download .gcode
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {dockTab === 'size' && (
+                <div className="dock-pane dock-size">
+                  <p className="muted tiny">
+                    Pick a straight edge or radius on the model, then enter the real size. MoonLamp:
+                    measure diameter as a <strong>line</strong> → 350 mm, or <strong>radius</strong> →
+                    175 mm.
+                  </p>
+                  <div className="row-actions">
+                    <button
+                      type="button"
+                      className={measureMode === 'line' ? 'primary' : ''}
+                      disabled={!model || busy}
+                      onClick={() => startMeasure('line')}
+                    >
+                      Measure line
+                    </button>
+                    <button
+                      type="button"
+                      className={measureMode === 'radius' ? 'primary' : ''}
+                      disabled={!model || busy}
+                      onClick={() => startMeasure('radius')}
+                    >
+                      Measure radius
+                    </button>
+                    <button
+                      type="button"
+                      disabled={measurePoints.length === 0 && measureMode === 'off'}
+                      onClick={() => {
+                        setMeasureMode('off');
+                        clearMeasure();
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <div className="dock-size-grid">
+                    <label>
+                      Measured ({measureMode === 'radius' ? 'radius' : 'length'})
+                      <input
+                        type="text"
+                        className="mono"
+                        readOnly
+                        value={
+                          measuredFeatureMm > 0 ? `${formatNum(measuredFeatureMm)} model-mm` : '—'
+                        }
+                      />
+                    </label>
+                    <label>
+                      {measureMode === 'radius' ? 'Real radius (mm)' : 'Real length (mm)'}
+                      <NumberInput
+                        step={0.1}
+                        min={0.01}
+                        value={knownSizeMm}
+                        onChange={setKnownSizeMm}
+                      />
+                    </label>
+                    <label>
+                      Scale factor
+                      <input
+                        type="text"
+                        className="mono"
+                        readOnly
+                        value={
+                          measurePoints.length >= 2 ? `×${formatNum(pendingSizeScale)}` : '—'
+                        }
+                      />
+                    </label>
+                  </div>
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={!model || busy || measurePoints.length < 2}
+                    onClick={applyMeasuredSize}
+                  >
+                    Apply size to model
+                  </button>
+                </div>
+              )}
+
+              {dockTab === 'params' && (
+                <div className="dock-pane dock-params">
+                  <p className="muted tiny">
+                    Live overrides for this session (base file{' '}
+                    <a className="config-link" href={PRINT_CONFIG_URL} target="_blank" rel="noreferrer">
+                      bambu-a1-mini-print.json
+                    </a>
+                    ).
+                  </p>
+                  <div className="dock-params-grid">
+                    <label>
+                      Nozzle (mm)
+                      <NumberInput step={0.05} min={0.1} max={1} value={paramNozzle} onChange={setParamNozzle} />
+                    </label>
+                    <label>
+                      Layer (mm)
+                      <NumberInput step={0.01} min={0.04} max={0.4} value={paramLayer} onChange={setParamLayer} />
+                    </label>
+                    <label>
+                      Walls
+                      <NumberInput step={1} min={1} max={12} value={paramWalls} onChange={setParamWalls} />
+                    </label>
+                    <label>
+                      Infill %
+                      <NumberInput step={1} min={0} max={100} value={paramInfill} onChange={setParamInfill} />
+                    </label>
+                    <label>
+                      Time scale
+                      <NumberInput
+                        step={0.001}
+                        min={0.01}
+                        max={5}
+                        value={paramTimeScale}
+                        onChange={setParamTimeScale}
+                      />
+                    </label>
+                  </div>
+                  <p className="muted tiny">
+                    Default scale 0.4951 calibrates full MoonLamp (~35 cm) to 39.9 h.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
         </main>
 
         <aside className="panel right">
@@ -819,6 +1246,11 @@ export default function ModelSimplifier() {
                   const isLatest = i === latestIndex;
                   const delta =
                     i === 0 ? null : entry.triangleCount - history[i - 1].triangleCount;
+                  const prevEst = i > 0 ? history[i - 1].printEstimate : null;
+                  const printDeltaSec =
+                    entry.printEstimate && prevEst
+                      ? entry.printEstimate.seconds - prevEst.seconds
+                      : null;
                   return (
                     <li key={entry.id} className={isLatest ? 'history-row latest' : 'history-row'}>
                       <button
@@ -839,6 +1271,22 @@ export default function ModelSimplifier() {
                             <span className="history-step mono">#{i + 1}</span>
                             {entry.label}
                             {isLatest && <span className="history-latest-tag">latest</span>}
+                          </span>
+                          <span className="history-print mono">
+                            {entry.printEstimate
+                              ? <>A1 Mini ≈ {entry.printEstimate.label}
+                                {printDeltaSec != null && Math.abs(printDeltaSec) >= 30 && (
+                                  <span className="muted">
+                                    {' '}
+                                    (
+                                    {printDeltaSec < 0
+                                      ? `−${formatPrintDelta(-printDeltaSec)}`
+                                      : `+${formatPrintDelta(printDeltaSec)}`}
+                                    )
+                                  </span>
+                                )}
+                              </>
+                              : <span className="muted">not sliced</span>}
                           </span>
                           <span className="history-meta muted tiny">
                             {formatTime(entry.at)} · {formatCount(entry.triangleCount)} tris ·{' '}
@@ -903,7 +1351,11 @@ export default function ModelSimplifier() {
         <span>{status}</span>
         <span className="muted">
           {model
-            ? `${formatCount(model.triangleCount)} tris · ${parts.length} parts · ${selectedIds.length} sel · hist ${historyIndex + 1}/${history.length}`
+            ? `${formatCount(model.triangleCount)} tris · ${
+                model.printEstimate
+                  ? `A1 Mini ≈ ${model.printEstimate.label}`
+                  : 'not sliced'
+              } · hist ${historyIndex + 1}/${history.length}`
             : 'No model'}
         </span>
       </footer>

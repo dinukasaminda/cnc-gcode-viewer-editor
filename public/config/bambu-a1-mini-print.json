@@ -1,0 +1,73 @@
+{
+  "$schema_comment": "Bambu Lab A1 Mini print-time estimator. 3MF is not printable until sliced — the app uses these params to synthesize an estimated G-code path and time.",
+  "printer": {
+    "name": "Bambu Lab A1 Mini",
+    "buildVolumeMm": [180, 180, 180],
+    "structure": "bed_slinger",
+    "maxToolheadSpeedMmPerSec": 500,
+    "maxAccelerationMmPerSec2": 10000
+  },
+  "nozzle": {
+    "diameterMm": 0.2,
+    "lineWidthMm": 0.22,
+    "maxVolumetricFlowMm3PerSec": 6
+  },
+  "layer": {
+    "layerHeightMm": 0.1,
+    "initialLayerHeightMm": 0.12,
+    "secPerLayerOverhead": 1.4
+  },
+  "shell": {
+    "wallLoops": 4,
+    "topShellLayers": 5,
+    "bottomShellLayers": 5
+  },
+  "infill": {
+    "densityPercent": 15,
+    "pattern": "grid"
+  },
+  "speedsMmPerSec": {
+    "outerWall": 80,
+    "innerWall": 120,
+    "sparseInfill": 140,
+    "solidInfill": 100,
+    "topSurface": 80,
+    "firstLayer": 40,
+    "travel": 400
+  },
+  "timeModel": {
+    "comment": "extrudedVolume from walls+infill+skins; time = max(volume/flow, pathLength/avgSpeed) + layers*overhead, then *overheadFactor *scaleFactor",
+    "avgPrintSpeedWeight": {
+      "outerWall": 0.35,
+      "innerWall": 0.25,
+      "sparseInfill": 0.25,
+      "solidInfill": 0.15
+    },
+    "overheadFactor": 1.22,
+    "scaleFactor": 0.4951
+  },
+  "calibration": {
+    "referenceFile": "MoonLamp+v2.2.3mf",
+    "referenceLabel": "MoonLamp v2.2 full kit (~35 cm moon + parts)",
+    "referenceDiameterMm": 350,
+    "referenceMeshVolumeMm3": 1219558,
+    "referenceSurfaceAreaMm2": 579144,
+    "referenceMaxDiagonalMm": 346.68,
+    "referencePrintHours": 39.9,
+    "rawUnscaledHoursBeforeCalibration": 80.59,
+    "scaleFactorDerivation": "39.9 / 80.59 ≈ 0.4951",
+    "notes": [
+      "Ground truth: full MoonLamp print takes ~39.9 h with all parts (user / listing).",
+      "Mesh metrics measured from 3D/Objects/*.model inside the 3MF (sum of closed volumes).",
+      "Embedded project_settings in the 3MF are P1S 0.4 nozzle / 0.16 mm / 2 walls — NOT used.",
+      "This profile targets A1 Mini 0.2 nozzle, 0.1 mm layer, 4 walls, 15% infill.",
+      "Estimates are relative; regenerate after changing JSON (scaleFactor, speeds, walls, etc)."
+    ]
+  },
+  "gcode": {
+    "headerFlavor": "bambu_estimate",
+    "filamentDiameterMm": 1.75,
+    "includeLayerMarkers": true,
+    "maxLayerMarkers": 40
+  }
+}

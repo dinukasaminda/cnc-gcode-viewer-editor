@@ -312,3 +312,18 @@ export function remapGroupsAfterReplace(
 export function cloneGroups(groups: PartGroup[]): PartGroup[] {
   return groups.map((g) => ({ ...g, partIds: [...g.partIds] }));
 }
+
+/** Uniform scale all part geometries (keeps part ids). */
+export function scalePartsUniform(parts: MeshPart[], factor: number): MeshPart[] {
+  if (!Number.isFinite(factor) || factor <= 0 || Math.abs(factor - 1) < 1e-12) {
+    return parts.map(clonePart);
+  }
+  return parts.map((p) => {
+    const g = clonePart(p).geometry;
+    g.scale(factor, factor, factor);
+    g.computeVertexNormals();
+    g.computeBoundingBox();
+    g.computeBoundingSphere();
+    return makePart(g, p.id);
+  });
+}
