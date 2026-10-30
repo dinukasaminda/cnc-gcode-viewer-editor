@@ -1,4 +1,4 @@
-import { useEffect, useState, type ChangeEvent, type FocusEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type FocusEvent } from 'react';
 import { formatNum, roundMm } from '../core/format';
 
 interface Props {
@@ -28,10 +28,33 @@ export function NumberInput({
 }: Props) {
   const [focused, setFocused] = useState(false);
   const [text, setText] = useState(() => formatNum(value));
+  const inputRef = useRef<HTMLInputElement>(null);
+  const valueRef = useRef(value);
+  const onChangeRef = useRef(onChange);
+  valueRef.current = value;
+  onChangeRef.current = onChange;
 
   useEffect(() => {
     if (!focused) setText(formatNum(value));
   }, [value, focused]);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (el.disabled) return;
+      e.preventDefault();
+      const stepNum = typeof step === 'string' ? parseFloat(step) : step;
+      const delta = (Number.isFinite(stepNum) && stepNum > 0 ? stepNum : 1) * (e.deltaY < 0 ? 1 : -1);
+      let next = roundMm(valueRef.current + delta);
+      if (min != null) next = Math.max(min, next);
+      if (max != null) next = Math.min(max, next);
+      onChangeRef.current(next);
+      setText(formatNum(next));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [step, min, max]);
 
   const commit = (raw: string) => {
     const parsed = parseFloat(raw);
@@ -70,11 +93,12 @@ export function NumberInput({
 
   return (
     <input
+      ref={inputRef}
       type="text"
       inputMode="decimal"
       className={className}
       disabled={disabled}
-      title={title}
+      title={title ?? 'Scroll to change'}
       step={step}
       min={min}
       max={max}

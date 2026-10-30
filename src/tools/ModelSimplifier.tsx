@@ -26,11 +26,9 @@ import {
   type PartGroup,
 } from '../core/meshParts';
 import {
-  DEFAULT_3MF_SAMPLE,
   download3mf,
   exportGeometryTo3mf,
   load3mfFromArrayBuffer,
-  load3mfFromUrl,
   suggested3mfName,
 } from '../core/threemf';
 import {
@@ -142,7 +140,6 @@ export default function ModelSimplifier() {
   const [paramInfill, setParamInfill] = useState(15);
   const [paramTimeScale, setParamTimeScale] = useState(0.4951);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const autoLoaded = useRef(false);
   const timelineRef = useRef<HTMLUListElement>(null);
 
   const model = historyIndex >= 0 ? history[historyIndex] ?? null : null;
@@ -272,25 +269,6 @@ export default function ModelSimplifier() {
     },
     [resetToEntry]
   );
-
-  const loadDefault = useCallback(async () => {
-    setBusy(true);
-    setStatus('Loading MoonLamp sample (large file)…');
-    try {
-      const loaded = await load3mfFromUrl(DEFAULT_3MF_SAMPLE, 'MoonLamp+v2.2.3mf');
-      await ingestLoaded(loaded.name, loaded.geometry, 'Loaded MoonLamp', 'Sample model');
-    } catch (err) {
-      setStatus(`Failed to load sample: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setBusy(false);
-    }
-  }, [ingestLoaded]);
-
-  useEffect(() => {
-    if (autoLoaded.current) return;
-    autoLoaded.current = true;
-    void loadDefault();
-  }, [loadDefault]);
 
   useEffect(() => {
     loadPrintConfig()
@@ -737,11 +715,13 @@ export default function ModelSimplifier() {
           </div>
         </div>
         <div className="top-actions">
-          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={busy}>
-            Open .3mf
-          </button>
-          <button type="button" className="primary" onClick={() => void loadDefault()} disabled={busy}>
-            Load MoonLamp
+          <button
+            type="button"
+            className="primary"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={busy}
+          >
+            Upload .3mf
           </button>
           <button type="button" onClick={undo} disabled={busy || !canUndo}>
             Undo
@@ -782,7 +762,17 @@ export default function ModelSimplifier() {
                 <dd className="mono">{formatNum(bboxDiag)} mm</dd>
               </dl>
             ) : (
-              <p className="muted">No model loaded</p>
+              <>
+                <p className="muted">No model loaded</p>
+                <button
+                  type="button"
+                  className="primary wide"
+                  disabled={busy}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  Upload .3mf
+                </button>
+              </>
             )}
             <p className="muted tiny scope-hint">{scopeHint}</p>
           </section>
@@ -1005,6 +995,18 @@ export default function ModelSimplifier() {
               onSurfaceHit={onSurfaceHit}
             />
             {busy && <div className="viewport-busy">Working…</div>}
+            {!model && !busy && (
+              <div className="viewport-empty">
+                <p>No model loaded</p>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  Upload .3mf
+                </button>
+              </div>
+            )}
             {measureMode !== 'off' && (
               <div className="measure-banner">
                 Measuring {measureMode === 'line' ? 'line' : 'radius'} — click model (

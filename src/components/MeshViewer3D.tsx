@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { createViewCube, type ViewCubeHandle } from './viewCube';
 
 export interface ViewerPart {
   id: string;
@@ -41,6 +42,10 @@ export interface MeshViewer3DProps {
   pickEnabled?: boolean;
   measureMode?: MeasureMode;
   measurePoints?: MeasurePoint[];
+  /** World up axis. Use `z` when the model XY plane is the floor (image / print bed). */
+  upAxis?: 'y' | 'z';
+  /** Solid bed plate under the model (viewer-only, not exported). */
+  bedColor?: 'yellow' | 'white' | 'black' | 'none';
   onPartClick?: (ev: PartClickEvent) => void;
   onSurfaceHit?: (ev: SurfaceHitEvent) => void;
 }
@@ -62,9 +67,12 @@ export function MeshViewer3D({
   pickEnabled = true,
   measureMode = 'off',
   measurePoints = [],
+  upAxis = 'y',
+  bedColor = 'none',
   onPartClick,
   onSurfaceHit,
 }: MeshViewer3DProps) {
+  const shellRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const onPartClickRef = useRef(onPartClick);
   onPartClickRef.current = onPartClick;
@@ -82,23 +90,36 @@ export function MeshViewer3D({
     controls: OrbitControls;
     root: THREE.Group;
     overlay: THREE.Group;
+    bed: THREE.Mesh | null;
+    grid: THREE.GridHelper;
     meshes: Map<string, THREE.Mesh>;
     raycaster: THREE.Raycaster;
     pointer: THREE.Vector2;
     modelRadius: number;
+    upAxis: 'y' | 'z';
+    viewCube: ViewCubeHandle;
   } | null>(null);
   const partsRef = useRef(parts);
   partsRef.current = parts;
 
   useEffect(() => {
+    const shell = shellRef.current;
     const host = hostRef.current;
-    if (!host) return;
+    if (!shell || !host) return;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b0f14);
 
     const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1e6);
-    camera.position.set(80, 60, 100);
+    const zUp = upAxis === 'z';
+    if (zUp) {
+      // Default TOP view (look down −Z onto XY plane)
+      camera.up.set(0, 1, 0);
+      camera.position.set(0, 0, 120);
+    } else {
+      camera.up.set(0, 1, 0);
+      camera.position.set(80, 60, 100);
+    }
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -144,13 +165,15 @@ export function MeshViewer3D({
     const hemi = new THREE.HemisphereLight(0xddeeff, 0x223344, 1.1);
     scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 1.35);
-    key.position.set(2, 4, 3);
+    key.position.set(zUp ? 2 : 2, zUp ? -3 : 4, zUp ? 5 : 3);
     scene.add(key);
     const fill = new THREE.DirectionalLight(0x88aacc, 0.45);
-    fill.position.set(-3, 1, -2);
+    fill.position.set(zUp ? -3 : -3, zUp ? 2 : 1, zUp ? 2 : -2);
     scene.add(fill);
 
+    // Default GridHelper is XZ (Y-up). For Z-up, rotate so the grid lies on XY.
     const grid = new THREE.GridHelper(200, 20, 0x3a516a, 0x1c2836);
+    if (zUp) grid.rotation.x = Math.PI / 2;
     scene.add(grid);
 
     const root = new THREE.Group();
@@ -226,11 +249,24 @@ export function MeshViewer3D({
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
 
+    const viewCube = createViewCube({
+      upAxis,
+      onFaceSelect: (viewDir, up) => {
+        const dist = Math.max(camera.position.distanceTo(controls.target), 1);
+        camera.up.copy(up);
+        camera.position.copy(controls.target).addScaledVector(viewDir, dist);
+        camera.lookAt(controls.target);
+        controls.update();
+      },
+    });
+    shell.appendChild(viewCube.canvas);
+
     let raf = 0;
     const tick = () => {
       raf = requestAnimationFrame(tick);
       controls.update();
       renderer.render(scene, camera);
+      viewCube.render(camera, controls.target);
     };
     tick();
 
@@ -241,11 +277,16 @@ export function MeshViewer3D({
       controls,
       root,
       overlay,
+      bed: null,
+      grid,
       meshes: new Map(),
       raycaster,
       pointer,
       modelRadius: 50,
+      upAxis,
+      viewCube,
     };
+    fitCamera();
 
     return () => {
       cancelAnimationFrame(raf);
@@ -255,17 +296,20 @@ export function MeshViewer3D({
       renderer.domElement.removeEventListener('pointerdown', onPointerCursorDown);
       window.removeEventListener('pointerup', onPointerCursorUp);
       renderer.domElement.removeEventListener('contextmenu', onContextMenu);
+      viewCube.dispose();
+      if (viewCube.canvas.parentElement === shell) shell.removeChild(viewCube.canvas);
       controls.dispose();
       renderer.dispose();
       if (renderer.domElement.parentElement === host) host.removeChild(renderer.domElement);
       ctxRef.current = null;
     };
-  }, []);
+  }, [upAxis]);
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    host.style.cursor = measureMode !== 'off' ? 'crosshair' : 'grab';
+    const canvas = host.querySelector('canvas');
+    if (canvas) canvas.style.cursor = measureMode !== 'off' ? 'crosshair' : 'grab';
   }, [measureMode]);
 
   useEffect(() => {
@@ -307,7 +351,91 @@ export function MeshViewer3D({
     }
   }, [parts, wireframe]);
 
+  const removeBed = (ctx: NonNullable<typeof ctxRef.current>) => {
+    // Purge any leaked bed meshes (Strict Mode / effect re-runs)
+    const stray: THREE.Object3D[] = [];
+    ctx.scene.traverse((obj) => {
+      if (obj.name === 'bed') stray.push(obj);
+    });
+    for (const obj of stray) {
+      ctx.scene.remove(obj);
+      const mesh = obj as THREE.Mesh;
+      mesh.geometry?.dispose();
+      const mat = mesh.material;
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+      else (mat as THREE.Material | undefined)?.dispose();
+    }
+    ctx.bed = null;
+  };
+
+  const syncBedTransform = (
+    ctx: NonNullable<typeof ctxRef.current>,
+    center: THREE.Vector3,
+    size: THREE.Vector3,
+    radius: number
+  ) => {
+    if (!ctx.bed) return;
+    // One plate matching the model footprint (image size), slight margin — not a second huge bed
+    const margin = 1.04;
+    const bw = Math.max(size.x * margin, 1);
+    const bh = Math.max((ctx.upAxis === 'z' ? size.y : size.z) * margin, 1);
+    ctx.bed.geometry.dispose();
+    ctx.bed.geometry = new THREE.PlaneGeometry(bw, bh);
+    if (ctx.upAxis === 'z') {
+      ctx.bed.rotation.set(0, 0, 0);
+      ctx.bed.position.set(center.x, center.y, Math.min(0, center.z - size.z * 0.5) - 0.08);
+    } else {
+      ctx.bed.rotation.set(-Math.PI / 2, 0, 0);
+      ctx.bed.position.set(center.x, Math.min(0, center.y - size.y * 0.5) - 0.08, center.z);
+    }
+    void radius;
+  };
+
+  // Solid bed under the model (viewer-only) — one instance; color changes only
   useEffect(() => {
+    const ctx = ctxRef.current;
+    if (!ctx) return;
+
+    removeBed(ctx);
+
+    if (bedColor === 'none') {
+      ctx.grid.visible = true;
+      return;
+    }
+
+    const geo = new THREE.PlaneGeometry(80, 80);
+    const bedHex =
+      bedColor === 'yellow' ? 0xe8c84a : bedColor === 'white' ? 0xf4f6f8 : 0x1a1d22;
+    const mat = new THREE.MeshStandardMaterial({
+      color: bedHex,
+      metalness: bedColor === 'yellow' ? 0.08 : 0.04,
+      roughness: bedColor === 'yellow' ? 0.72 : 0.88,
+      side: THREE.FrontSide,
+      depthWrite: true,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
+    });
+    const bed = new THREE.Mesh(geo, mat);
+    bed.name = 'bed';
+    bed.renderOrder = -2;
+    if (ctx.upAxis === 'z') {
+      bed.position.z = -0.05;
+    } else {
+      bed.rotation.x = -Math.PI / 2;
+      bed.position.y = -0.05;
+    }
+    ctx.scene.add(bed);
+    ctx.bed = bed;
+    ctx.grid.visible = false;
+
+    return () => {
+      removeBed(ctx);
+      ctx.grid.visible = true;
+    };
+  }, [bedColor, upAxis]);
+
+  function fitCamera() {
     const ctx = ctxRef.current;
     const currentParts = partsRef.current;
     if (!ctx || currentParts.length === 0) return;
@@ -324,12 +452,25 @@ export function MeshViewer3D({
     const r = Math.max(size.length() * 0.5, 1e-3);
     ctx.modelRadius = r;
     ctx.controls.target.copy(center);
-    ctx.camera.position.copy(center).add(new THREE.Vector3(r * 1.8, r * 1.2, r * 2.2));
+    if (ctx.upAxis === 'z') {
+      // TOP: above the plate looking down
+      ctx.camera.up.set(0, 1, 0);
+      ctx.camera.position.set(center.x, center.y, center.z + Math.max(r * 2.4, size.z + r * 1.2));
+    } else {
+      ctx.camera.up.set(0, 1, 0);
+      ctx.camera.position.copy(center).add(new THREE.Vector3(r * 1.8, r * 1.2, r * 2.2));
+    }
+    ctx.camera.lookAt(center);
     ctx.camera.near = Math.max(r / 200, 0.01);
     ctx.camera.far = Math.max(r * 40, 1000);
     ctx.camera.updateProjectionMatrix();
     ctx.controls.update();
-  }, [resetKey]);
+    syncBedTransform(ctx, center, size, r);
+  }
+
+  useEffect(() => {
+    fitCamera();
+  }, [resetKey, upAxis]);
 
   // Measure overlay: points, line, radius circle
   useEffect(() => {
@@ -425,5 +566,9 @@ export function MeshViewer3D({
     }
   }, [measurePoints, measureMode]);
 
-  return <div ref={hostRef} className={className ?? 'viewport'} />;
+  return (
+    <div ref={shellRef} className={`${className ?? 'viewport'} viewport-root`}>
+      <div ref={hostRef} className="viewport-host" />
+    </div>
+  );
 }

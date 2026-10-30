@@ -95,24 +95,46 @@ function fmt(n: number): string {
   return (Math.round(n * 1e5) / 1e5).toString();
 }
 
-/** Build a minimal single-object 3MF (ZIP) from a BufferGeometry. */
-export function exportGeometryTo3mf(geometry: THREE.BufferGeometry, objectName = 'Model'): Uint8Array {
-  const geo = geometry.index ? geometry : geometry.toNonIndexed();
+/** Weld split vertices (flat-shaded extrusions) so slicers get a closed, shared-vertex mesh. */
+function weldPositions(geo: THREE.BufferGeometry): { positions: number[]; indices: Uint32Array } {
   const pos = geo.getAttribute('position');
-  if (!pos) throw new Error('Geometry has no positions');
-
-  let indices: ArrayLike<number>;
-  if (geo.index) {
-    indices = geo.index.array;
-  } else {
-    const arr = new Uint32Array(pos.count);
-    for (let i = 0; i < pos.count; i++) arr[i] = i;
-    indices = arr;
-  }
-
-  const vertexLines: string[] = new Array(pos.count);
+  const src = geo.index ? geo.index.array : null;
+  const triVerts = src ? src.length : pos.count;
+  const map = new Map<string, number>();
+  const positions: number[] = [];
+  const remap = new Uint32Array(pos.count);
   for (let i = 0; i < pos.count; i++) {
-    vertexLines[i] = `<vertex x="${fmt(pos.getX(i))}" y="${fmt(pos.getY(i))}" z="${fmt(pos.getZ(i))}" />`;
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const z = pos.getZ(i);
+    const key = `${Math.round(x * 1e4)},${Math.round(y * 1e4)},${Math.round(z * 1e4)}`;
+    let id = map.get(key);
+    if (id === undefined) {
+      id = positions.length / 3;
+      positions.push(x, y, z);
+      map.set(key, id);
+    }
+    remap[i] = id;
+  }
+  const out: number[] = [];
+  for (let t = 0; t + 2 < triVerts; t += 3) {
+    const a = remap[src ? src[t] : t];
+    const b = remap[src ? src[t + 1] : t + 1];
+    const c = remap[src ? src[t + 2] : t + 2];
+    if (a === b || b === c || a === c) continue;
+    out.push(a, b, c);
+  }
+  return { positions, indices: new Uint32Array(out) };
+}
+
+function geometryToMeshXml(geometry: THREE.BufferGeometry, objectId: number, objectName: string): string {
+  if (!geometry.getAttribute('position')) throw new Error('Geometry has no positions');
+  const { positions, indices } = weldPositions(geometry);
+  const vertCount = positions.length / 3;
+
+  const vertexLines: string[] = new Array(vertCount);
+  for (let i = 0; i < vertCount; i++) {
+    vertexLines[i] = `<vertex x="${fmt(positions[i * 3])}" y="${fmt(positions[i * 3 + 1])}" z="${fmt(positions[i * 3 + 2])}" />`;
   }
 
   const triCount = Math.floor(indices.length / 3);
@@ -122,12 +144,7 @@ export function exportGeometryTo3mf(geometry: THREE.BufferGeometry, objectName =
     triangleLines[t] = `<triangle v1="${indices[i]}" v2="${indices[i + 1]}" v3="${indices[i + 2]}" />`;
   }
 
-  const modelXml = `<?xml version="1.0" encoding="UTF-8"?>
-<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
-  <metadata name="Application">cnc-gcode-viewer 3MF Simplifier</metadata>
-  <metadata name="Title">${escapeXml(objectName)}</metadata>
-  <resources>
-    <object id="1" name="${escapeXml(objectName)}" type="model">
+  return `    <object id="${objectId}" name="${escapeXml(objectName)}" type="model">
       <mesh>
         <vertices>
 ${vertexLines.join('\n')}
@@ -136,10 +153,35 @@ ${vertexLines.join('\n')}
 ${triangleLines.join('\n')}
         </triangles>
       </mesh>
-    </object>
+    </object>`;
+}
+
+export interface ThreemfObject {
+  name: string;
+  geometry: THREE.BufferGeometry;
+}
+
+/** Build a 3MF (ZIP) with one or more mesh objects (separate printable parts). */
+export function exportGeometriesTo3mf(
+  objects: ThreemfObject[],
+  title = 'Model'
+): Uint8Array {
+  if (objects.length === 0) throw new Error('No objects to export');
+
+  const resourceXml = objects
+    .map((o, i) => geometryToMeshXml(o.geometry, i + 1, o.name || `Part ${i + 1}`))
+    .join('\n');
+  const buildXml = objects.map((_, i) => `    <item objectid="${i + 1}" />`).join('\n');
+
+  const modelXml = `<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <metadata name="Application">SKL Tools Image→3D</metadata>
+  <metadata name="Title">${escapeXml(title)}</metadata>
+  <resources>
+${resourceXml}
   </resources>
   <build>
-    <item objectid="1" />
+${buildXml}
   </build>
 </model>
 `;
@@ -165,6 +207,11 @@ ${triangleLines.join('\n')}
     },
     { level: 6 }
   );
+}
+
+/** Build a minimal single-object 3MF (ZIP) from a BufferGeometry. */
+export function exportGeometryTo3mf(geometry: THREE.BufferGeometry, objectName = 'Model'): Uint8Array {
+  return exportGeometriesTo3mf([{ name: objectName, geometry }], objectName);
 }
 
 function escapeXml(s: string): string {
