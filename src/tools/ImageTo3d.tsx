@@ -16,7 +16,6 @@ import {
 } from '../core/imageExtrude';
 import { formatNum } from '../core/format';
 import {
-  DEFAULT_LOGO_SAMPLE,
   clearFineBackground,
   countFineBgPixels,
   DEFAULT_PART_HEIGHT_MM,
@@ -114,7 +113,6 @@ export default function ImageTo3d() {
   const panDrag = useRef<{ px: number; py: number; x: number; y: number } | null>(null);
   const needsViewReset = useRef(true);
   imgViewRef.current = { zoom: imgZoom, x: imgPan.x, y: imgPan.y };
-  const autoLoaded = useRef(false);
   const objectUrlRef = useRef<string | null>(null);
   const segmentedRef = useRef<SegmentedImage | null>(null);
   const rawRef = useRef<SegmentedImage | null>(null);
@@ -295,30 +293,11 @@ export default function ImageTo3d() {
     [bgTolerance, widthMm, baseEnabled, baseHeightMm, rebuildPreview, rebuildMesh]
   );
 
-  const loadDefault = useCallback(async () => {
-    setBusy(true);
-    setStatus('Loading logo-clear.png…');
-    try {
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-        objectUrlRef.current = null;
-      }
-      const img = await loadImageElement(DEFAULT_LOGO_SAMPLE);
-      await ingestImage(img, 'logo-clear.png');
-    } catch (err) {
-      setStatus(`Load failed: ${err instanceof Error ? err.message : String(err)}`);
-      setBusy(false);
-    }
-  }, [ingestImage]);
-
   useEffect(() => {
-    if (autoLoaded.current) return;
-    autoLoaded.current = true;
-    void loadDefault();
     return () => {
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
     };
-  }, [loadDefault]);
+  }, []);
 
   useEffect(() => {
     if (!segmented) return;
@@ -704,11 +683,8 @@ export default function ImageTo3d() {
           </div>
         </div>
         <div className="top-actions">
-          <button type="button" onClick={() => fileInputRef.current?.click()} disabled={busy}>
+          <button type="button" className="primary" onClick={() => fileInputRef.current?.click()} disabled={busy}>
             Open image
-          </button>
-          <button type="button" className="primary" onClick={() => void loadDefault()} disabled={busy}>
-            Load logo-clear
           </button>
           <button type="button" onClick={export3mf} disabled={busy || extruded.length === 0}>
             Export .3mf
@@ -1011,7 +987,7 @@ export default function ImageTo3d() {
                 parts={viewerParts}
                 wireframe={wireframe}
                 resetKey={resetKey}
-                pickEnabled={!busy && activeTool === 'part'}
+                pickEnabled={!busy && (activeTool === 'part' || measureMode !== 'off')}
                 measureMode={measureMode}
                 measurePoints={measurePoints}
                 upAxis="z"
@@ -1033,8 +1009,8 @@ export default function ImageTo3d() {
             )}
             {measureMode !== 'off' && (
               <div className="measure-banner">
-                Measure distance — click model ({measurePoints.length}/2)
-                {measuredMm > 0 ? ` · ${formatNum(measuredMm)} mm` : ''} · RMB orbit · LMB drag pan
+                Measure distance — click two points on the model ({measurePoints.length}/2)
+                {measuredMm > 0 ? ` · ${formatNum(measuredMm)} mm` : ''} · RMB orbit · scroll zoom
               </div>
             )}
             {busy && <div className="viewport-busy">Working…</div>}

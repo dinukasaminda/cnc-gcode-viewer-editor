@@ -211,14 +211,15 @@ export function MeshViewer3D({
       const dx = e.clientX - down.x;
       const dy = e.clientY - down.y;
       down = null;
-      if (!pickEnabledRef.current) return;
+      const measuring = measureModeRef.current !== 'off';
+      if (!pickEnabledRef.current && !measuring) return;
       if (dx * dx + dy * dy > 36) return;
 
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(root.children, false);
+      const hits = raycaster.intersectObjects(root.children, true);
       if (hits.length === 0) return;
       const hit = hits[0];
       const mesh = hit.object as THREE.Mesh;
@@ -307,9 +308,14 @@ export function MeshViewer3D({
 
   useEffect(() => {
     const host = hostRef.current;
+    const ctx = ctxRef.current;
     if (!host) return;
     const canvas = host.querySelector('canvas');
     if (canvas) canvas.style.cursor = measureMode !== 'off' ? 'crosshair' : 'grab';
+    if (!ctx) return;
+    // LMB is a pick while measuring — don't start a pan on the same click.
+    ctx.controls.mouseButtons.LEFT =
+      measureMode !== 'off' ? (-1 as THREE.MOUSE) : THREE.MOUSE.PAN;
   }, [measureMode]);
 
   useEffect(() => {

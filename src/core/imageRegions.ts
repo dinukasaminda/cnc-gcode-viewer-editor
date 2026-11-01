@@ -1,5 +1,3 @@
-export const DEFAULT_LOGO_SAMPLE = '/samples/logo-clear.png';
-
 export interface Rgba {
   r: number;
   g: number;
