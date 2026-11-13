@@ -1,4 +1,4 @@
-export type AppToolId = 'image3d' | 'simplify' | 'pcb';
+export type AppToolId = 'image3d' | 'perfboard' | 'simplify' | 'pcb';
 
 export interface AppTool {
   id: AppToolId;
@@ -16,6 +16,13 @@ export const APP_TOOLS: AppTool[] = [
     label: 'Image → 3D',
     short: '2→3',
     description: 'Logo / image color regions to multi-part 3MF',
+  },
+  {
+    id: 'perfboard',
+    path: '/perfboard',
+    label: 'Perfboard',
+    short: 'PB',
+    description: 'Standard 2.54 mm dot board — measure, rectangles, pins',
   },
   {
     id: 'simplify',
@@ -39,6 +46,7 @@ export function toolFromPathname(pathname: string): AppToolId {
   const path = pathname.replace(/\/+$/, '') || '/';
   if (path === '/pcb' || path.startsWith('/pcb/')) return 'pcb';
   if (path === '/simplify' || path.startsWith('/simplify/')) return 'simplify';
+  if (path === '/perfboard' || path.startsWith('/perfboard/')) return 'perfboard';
   if (path === '/image3d' || path.startsWith('/image3d/')) return 'image3d';
   return DEFAULT_TOOL;
 }

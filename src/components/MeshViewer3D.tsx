@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type MutableRefObject } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createViewCube, type ViewCubeHandle } from './viewCube';
@@ -34,6 +34,14 @@ export interface MeasurePoint {
   z: number;
 }
 
+export interface MeasureOverlayLine {
+  a: MeasurePoint;
+  b: MeasurePoint;
+  color?: number;
+  /** Drawn floating above the midpoint of the line. */
+  label?: string;
+}
+
 export interface MeshViewer3DProps {
   parts: ViewerPart[];
   wireframe?: boolean;
@@ -42,13 +50,20 @@ export interface MeshViewer3DProps {
   pickEnabled?: boolean;
   measureMode?: MeasureMode;
   measurePoints?: MeasurePoint[];
+  /** Extra saved measure lines (drawn even when measureMode is off). */
+  measureOverlays?: MeasureOverlayLine[];
   /** World up axis. Use `z` when the model XY plane is the floor (image / print bed). */
   upAxis?: 'y' | 'z';
   /** Solid bed plate under the model (viewer-only, not exported). */
   bedColor?: 'yellow' | 'white' | 'black' | 'none';
   onPartClick?: (ev: PartClickEvent) => void;
   onSurfaceHit?: (ev: SurfaceHitEvent) => void;
+  onSurfaceMove?: (ev: SurfaceHitEvent | null) => void;
+  /** Filled with a function that captures an orthographic TOP PNG (data URL). */
+  captureTopViewRef?: MutableRefObject<(() => string | null) | null>;
 }
+
+const EMPTY_OVERLAYS: MeasureOverlayLine[] = [];
 
 function makeMarker(color: number, radius: number): THREE.Mesh {
   const mesh = new THREE.Mesh(
@@ -59,6 +74,104 @@ function makeMarker(color: number, radius: number): THREE.Mesh {
   return mesh;
 }
 
+function colorCss(color: number): string {
+  return `#${color.toString(16).padStart(6, '0')}`;
+}
+
+function disposeOverlayChild(child: THREE.Object3D) {
+  if ((child as THREE.Mesh).isMesh) {
+    const mesh = child as THREE.Mesh;
+    mesh.geometry.dispose();
+    const mat = mesh.material;
+    if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+    else mat.dispose();
+    return;
+  }
+  if ((child as THREE.Line).isLine) {
+    const line = child as THREE.Line;
+    line.geometry.dispose();
+    (line.material as THREE.Material).dispose();
+    return;
+  }
+  if ((child as THREE.Sprite).isSprite) {
+    const sprite = child as THREE.Sprite;
+    sprite.material.map?.dispose();
+    sprite.material.dispose();
+  }
+}
+
+function makeMeasureLabel(text: string, color: number, worldH: number): THREE.Sprite {
+  const padX = 16;
+  const padY = 8;
+  const fontPx = 32;
+  const canvas = document.createElement('canvas');
+  const ctx2d = canvas.getContext('2d')!;
+  ctx2d.font = `bold ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  const textW = Math.ceil(ctx2d.measureText(text).width);
+  const w = textW + padX * 2;
+  const h = fontPx + padY * 2;
+  canvas.width = w;
+  canvas.height = h;
+  ctx2d.font = `bold ${fontPx}px ui-sans-serif, system-ui, sans-serif`;
+  ctx2d.textAlign = 'center';
+  ctx2d.textBaseline = 'middle';
+  const r = 12;
+  ctx2d.beginPath();
+  ctx2d.moveTo(r, 8);
+  ctx2d.arcTo(w - 8, 8, w - 8, h - 8, r);
+  ctx2d.arcTo(w - 8, h - 8, 8, h - 8, r);
+  ctx2d.arcTo(8, h - 8, 8, 8, r);
+  ctx2d.arcTo(8, 8, w - 8, 8, r);
+  ctx2d.closePath();
+  ctx2d.fillStyle = 'rgba(8, 16, 28, 0.88)';
+  ctx2d.fill();
+  ctx2d.strokeStyle = colorCss(color);
+  ctx2d.lineWidth = 2;
+  ctx2d.stroke();
+  ctx2d.fillStyle = colorCss(color);
+  ctx2d.fillText(text, w / 2, h / 2 + 1);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(worldH * (w / h), worldH, 1);
+  sprite.renderOrder = 22;
+  return sprite;
+}
+
+function labelPosition(
+  a: MeasurePoint,
+  b: MeasurePoint,
+  upAxis: 'y' | 'z',
+  lift: number
+): THREE.Vector3 {
+  const mid = new THREE.Vector3((a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2);
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  // Keep the tag on the board plane, just above the stroke (screen-up in TOP).
+  if (len > 1e-6) {
+    let px = -dy / len;
+    let py = dx / len;
+    if (py < -1e-6 || (Math.abs(py) < 1e-6 && px < 0)) {
+      px = -px;
+      py = -py;
+    }
+    const side = Math.min(2.2, Math.max(0.9, len * 0.08));
+    mid.x += px * side;
+    mid.y += py * side;
+  }
+  if (upAxis === 'z') mid.z += lift;
+  else mid.y += lift;
+  return mid;
+}
+
 export function MeshViewer3D({
   parts,
   wireframe = false,
@@ -67,10 +180,13 @@ export function MeshViewer3D({
   pickEnabled = true,
   measureMode = 'off',
   measurePoints = [],
+  measureOverlays = EMPTY_OVERLAYS,
   upAxis = 'y',
   bedColor = 'none',
   onPartClick,
   onSurfaceHit,
+  onSurfaceMove,
+  captureTopViewRef,
 }: MeshViewer3DProps) {
   const shellRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
@@ -78,6 +194,8 @@ export function MeshViewer3D({
   onPartClickRef.current = onPartClick;
   const onSurfaceHitRef = useRef(onSurfaceHit);
   onSurfaceHitRef.current = onSurfaceHit;
+  const onSurfaceMoveRef = useRef(onSurfaceMove);
+  onSurfaceMoveRef.current = onSurfaceMove;
   const pickEnabledRef = useRef(pickEnabled);
   pickEnabledRef.current = pickEnabled;
   const measureModeRef = useRef(measureMode);
@@ -199,8 +317,48 @@ export function MeshViewer3D({
     const pointer = new THREE.Vector2();
     let down: { x: number; y: number; button: number } | null = null;
 
+    const pickFromEvent = (e: PointerEvent) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return null;
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const pickList: THREE.Object3D[] = [...root.children];
+      const bed = scene.getObjectByName('bed');
+      if (bed) pickList.push(bed);
+      const hits = raycaster.intersectObjects(pickList, true);
+      if (hits.length === 0) return null;
+      const hit = hits[0];
+      const mesh = hit.object as THREE.Mesh;
+      const partId = (mesh.userData.partId as string | undefined) ?? (mesh.name === 'bed' ? 'bed' : undefined);
+      if (!partId) return null;
+      return { partId, point: hit.point };
+    };
+
     const onPointerDown = (e: PointerEvent) => {
       down = { x: e.clientX, y: e.clientY, button: e.button };
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (measureModeRef.current === 'off' || !onSurfaceMoveRef.current) return;
+      const picked = pickFromEvent(e);
+      if (!picked) {
+        onSurfaceMoveRef.current(null);
+        return;
+      }
+      onSurfaceMoveRef.current({
+        partId: picked.partId,
+        point: { x: picked.point.x, y: picked.point.y, z: picked.point.z },
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+      });
+    };
+
+    const onPointerLeave = () => {
+      if (measureModeRef.current === 'off') return;
+      onSurfaceMoveRef.current?.(null);
     };
 
     const onPointerUp = (e: PointerEvent) => {
@@ -215,21 +373,14 @@ export function MeshViewer3D({
       if (!pickEnabledRef.current && !measuring) return;
       if (dx * dx + dy * dy > 36) return;
 
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-      raycaster.setFromCamera(pointer, camera);
-      const hits = raycaster.intersectObjects(root.children, true);
-      if (hits.length === 0) return;
-      const hit = hits[0];
-      const mesh = hit.object as THREE.Mesh;
-      const partId = mesh.userData.partId as string | undefined;
-      if (!partId) return;
+      const picked = pickFromEvent(e);
+      if (!picked) return;
+      const { partId } = picked;
 
       if (measureModeRef.current !== 'off' && onSurfaceHitRef.current) {
         onSurfaceHitRef.current({
           partId,
-          point: { x: hit.point.x, y: hit.point.y, z: hit.point.z },
+          point: { x: picked.point.x, y: picked.point.y, z: picked.point.z },
           shiftKey: e.shiftKey,
           metaKey: e.metaKey,
           ctrlKey: e.ctrlKey,
@@ -237,6 +388,7 @@ export function MeshViewer3D({
         });
         return;
       }
+      if (partId === 'bed') return;
 
       onPartClickRef.current?.({
         partId,
@@ -249,6 +401,8 @@ export function MeshViewer3D({
 
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
+    renderer.domElement.addEventListener('pointermove', onPointerMove);
+    renderer.domElement.addEventListener('pointerleave', onPointerLeave);
 
     const viewCube = createViewCube({
       upAxis,
@@ -294,6 +448,8 @@ export function MeshViewer3D({
       ro.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('pointermove', onPointerMove);
+      renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
       renderer.domElement.removeEventListener('pointerdown', onPointerCursorDown);
       window.removeEventListener('pointerup', onPointerCursorUp);
       renderer.domElement.removeEventListener('contextmenu', onContextMenu);
@@ -478,6 +634,73 @@ export function MeshViewer3D({
     fitCamera();
   }, [resetKey, upAxis]);
 
+  useEffect(() => {
+    if (!captureTopViewRef) return;
+    captureTopViewRef.current = () => {
+      const ctx = ctxRef.current;
+      const host = hostRef.current;
+      const currentParts = partsRef.current;
+      if (!ctx || !host || currentParts.length === 0) return null;
+
+      const box = new THREE.Box3();
+      for (const p of currentParts) {
+        if (!p.geometry.boundingBox) p.geometry.computeBoundingBox();
+        if (p.geometry.boundingBox) box.union(p.geometry.boundingBox);
+      }
+      if (box.isEmpty()) return null;
+
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const margin = 1.08;
+      const widthMm = Math.max(size.x * margin, 1);
+      const heightMm = Math.max((ctx.upAxis === 'z' ? size.y : size.z) * margin, 1);
+      const aspect = widthMm / heightMm;
+      const maxPx = 2048;
+      const pxW = aspect >= 1 ? maxPx : Math.max(64, Math.round(maxPx * aspect));
+      const pxH = aspect >= 1 ? Math.max(64, Math.round(maxPx / aspect)) : maxPx;
+
+      const near = 0.1;
+      const far = Math.max(size.length() * 8, 200);
+      const ortho = new THREE.OrthographicCamera(
+        -widthMm / 2,
+        widthMm / 2,
+        heightMm / 2,
+        -heightMm / 2,
+        near,
+        far
+      );
+      if (ctx.upAxis === 'z') {
+        ortho.up.set(0, 1, 0);
+        ortho.position.set(center.x, center.y, center.z + Math.max(size.z, 1) + far * 0.25);
+      } else {
+        ortho.up.set(0, 0, -1);
+        ortho.position.set(center.x, center.y + Math.max(size.y, 1) + far * 0.25, center.z);
+      }
+      ortho.lookAt(center);
+      ortho.updateProjectionMatrix();
+
+      const gridWas = ctx.grid.visible;
+      ctx.grid.visible = false;
+      const prevPR = ctx.renderer.getPixelRatio();
+      ctx.renderer.setPixelRatio(1);
+      ctx.renderer.setSize(pxW, pxH, false);
+      ctx.renderer.render(ctx.scene, ortho);
+      const dataUrl = ctx.renderer.domElement.toDataURL('image/png');
+      ctx.renderer.setPixelRatio(prevPR);
+      const w = host.clientWidth || 1;
+      const h = host.clientHeight || 1;
+      ctx.renderer.setSize(w, h, false);
+      ctx.camera.aspect = w / h;
+      ctx.camera.updateProjectionMatrix();
+      ctx.grid.visible = gridWas;
+      ctx.renderer.render(ctx.scene, ctx.camera);
+      return dataUrl;
+    };
+    return () => {
+      captureTopViewRef.current = null;
+    };
+  }, [captureTopViewRef]);
+
   // Measure overlay: points, line, radius circle
   useEffect(() => {
     const ctx = ctxRef.current;
@@ -486,39 +709,54 @@ export function MeshViewer3D({
     while (ctx.overlay.children.length) {
       const child = ctx.overlay.children[0];
       ctx.overlay.remove(child);
-      if ((child as THREE.Mesh).isMesh) {
-        const mesh = child as THREE.Mesh;
-        mesh.geometry.dispose();
-        (mesh.material as THREE.Material).dispose();
-      } else if ((child as THREE.Line).isLine) {
-        const line = child as THREE.Line;
-        line.geometry.dispose();
-        (line.material as THREE.Material).dispose();
-      }
+      disposeOverlayChild(child);
+    }
+
+    const markerR = Math.max(ctx.modelRadius * 0.006, 0.28);
+    const labelH = Math.max(0.95, Math.min(1.65, ctx.modelRadius * 0.038));
+    const labelLift = Math.max(0.85, ctx.modelRadius * 0.032);
+    const addLine = (a: MeasurePoint, b: MeasurePoint, color: number) => {
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(a.x, a.y, a.z),
+        new THREE.Vector3(b.x, b.y, b.z),
+      ]);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, depthTest: false }));
+      line.renderOrder = 19;
+      ctx.overlay.add(line);
+    };
+    const addMark = (p: MeasurePoint, color: number) => {
+      const m = makeMarker(color, markerR);
+      m.position.set(p.x, p.y, p.z);
+      ctx.overlay.add(m);
+    };
+    const addLabel = (a: MeasurePoint, b: MeasurePoint, color: number, text: string) => {
+      if (!text.trim()) return;
+      const same =
+        Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6 && Math.abs(a.z - b.z) < 1e-6;
+      if (same) return;
+      const sprite = makeMeasureLabel(text, color, labelH);
+      sprite.position.copy(labelPosition(a, b, ctx.upAxis, labelLift));
+      ctx.overlay.add(sprite);
+    };
+
+    for (const line of measureOverlays) {
+      const color = line.color ?? 0x38bdf8;
+      addMark(line.a, color);
+      addMark(line.b, color);
+      addLine(line.a, line.b, color);
+      if (line.label) addLabel(line.a, line.b, color, line.label);
     }
 
     if (measurePoints.length === 0) return;
-    const markerR = Math.max(ctx.modelRadius * 0.008, 0.4);
 
     for (const p of measurePoints) {
-      const m = makeMarker(0xff3355, markerR);
-      m.position.set(p.x, p.y, p.z);
-      ctx.overlay.add(m);
+      addMark(p, 0xff3355);
     }
 
     if (measurePoints.length >= 2) {
       const a = measurePoints[0];
       const b = measurePoints[1];
-      const geo = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(a.x, a.y, a.z),
-        new THREE.Vector3(b.x, b.y, b.z),
-      ]);
-      const line = new THREE.Line(
-        geo,
-        new THREE.LineBasicMaterial({ color: 0xff3355, depthTest: false })
-      );
-      line.renderOrder = 19;
-      ctx.overlay.add(line);
+      addLine(a, b, 0xff3355);
 
       if (measureMode === 'radius') {
         const center = new THREE.Vector3(a.x, a.y, a.z);
@@ -570,7 +808,7 @@ export function MeshViewer3D({
         }
       }
     }
-  }, [measurePoints, measureMode]);
+  }, [measurePoints, measureMode, measureOverlays, upAxis]);
 
   return (
     <div ref={shellRef} className={`${className ?? 'viewport'} viewport-root`}>

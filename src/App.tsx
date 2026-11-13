@@ -7,6 +7,7 @@ import {
   type AppToolId,
 } from './core/routing';
 import ImageTo3d from './tools/ImageTo3d';
+import Perfboard from './tools/Perfboard';
 import ModelSimplifier from './tools/ModelSimplifier';
 import PcbGcodeViewer from './tools/PcbGcodeViewer';
 import './App.css';
@@ -69,6 +70,9 @@ export default function App() {
       <div className="tool-host">
         <div className={tool === 'image3d' ? 'tool-pane active' : 'tool-pane'} hidden={tool !== 'image3d'}>
           <ImageTo3d />
+        </div>
+        <div className={tool === 'perfboard' ? 'tool-pane active' : 'tool-pane'} hidden={tool !== 'perfboard'}>
+          <Perfboard />
         </div>
         <div className={tool === 'simplify' ? 'tool-pane active' : 'tool-pane'} hidden={tool !== 'simplify'}>
           <ModelSimplifier />

@@ -93,6 +93,7 @@ export default function ImageTo3d() {
   const [bgSmooth, setBgSmooth] = useState(2);
   const [bgGrow, setBgGrow] = useState(1);
   const [partHeightMm, setPartHeightMm] = useState(DEFAULT_PART_HEIGHT_MM);
+  const [heightPending, setHeightPending] = useState(false);
   const [partColor, setPartColor] = useState('#000000');
   const [wandBgParts, setWandBgParts] = useState<WandBgPart[]>([]);
   const [activeWandId, setActiveWandId] = useState<string | null>(null);
@@ -272,6 +273,7 @@ export default function ImageTo3d() {
         setActiveTool('wand');
         setSegmented(seg);
         setSelectedIds([]);
+        setHeightPending(false);
         rebuildPreview(seg, [], [], null);
         setExtruded((prev) => {
           disposeExtruded(prev);
@@ -354,7 +356,8 @@ export default function ImageTo3d() {
 
   const onSurfaceHit = useCallback(
     (ev: SurfaceHitEvent) => {
-      if (busy || measureMode === 'off') return;
+      if (busy) return;
+      if (measureMode === 'off') return;
       setMeasurePoints((prev) => {
         const next = [...prev, ev.point];
         if (next.length > 2) return [ev.point];
@@ -580,6 +583,7 @@ export default function ImageTo3d() {
     };
     segmentedRef.current = next;
     setSegmented(next);
+    setHeightPending(false);
     setStatus(`Height ${formatNum(h)} mm → all ${next.regions.length} parts`);
   };
 
@@ -621,6 +625,7 @@ export default function ImageTo3d() {
   const applyHeightToSelected = () => {
     if (selectedIds.length === 0) return;
     patchSelectedHeight(partHeightMm);
+    setHeightPending(false);
     setStatus(`Height ${formatNum(partHeightMm)} mm → ${selectedIds.length} selected part(s)`);
   };
 
@@ -977,9 +982,9 @@ export default function ImageTo3d() {
             {wandBgParts.length === 0 ? (
               <div className="stage-photo-wrap">
                 <p className="muted">
-                  3D preview waits for a background pick.
+                  Open an image and wand-pick background
                   <br />
-                  Use the wand on the source image (left).
+                  to build the 3D preview.
                 </p>
               </div>
             ) : (
@@ -1132,16 +1137,56 @@ export default function ImageTo3d() {
             <h2>Part height</h2>
             <label>
               Height (mm)
-              <NumberInput step={0.1} min={0.1} max={40} value={partHeightMm} onChange={setPartHeightMm} />
+              <NumberInput
+                step={0.1}
+                min={0.1}
+                max={40}
+                value={partHeightMm}
+                onChange={(n) => {
+                  setPartHeightMm(n);
+                  if (Math.abs(n - partHeightMm) > 1e-9) setHeightPending(true);
+                }}
+              />
             </label>
             <div className="row-actions">
-              <button type="button" disabled={!segmented?.regions.length} onClick={applyHeightToAll}>
+              <button
+                type="button"
+                className={
+                  heightPending && selectedIds.length === 0 && (segmented?.regions.length ?? 0) > 0
+                    ? 'needs-apply'
+                    : undefined
+                }
+                disabled={!segmented?.regions.length}
+                onClick={applyHeightToAll}
+                title={
+                  heightPending && selectedIds.length === 0
+                    ? 'Height changed — click to apply to all parts'
+                    : undefined
+                }
+              >
                 Change height · all parts
               </button>
-              <button type="button" disabled={selectedIds.length === 0} onClick={applyHeightToSelected}>
+              <button
+                type="button"
+                className={heightPending && selectedIds.length > 0 ? 'needs-apply' : undefined}
+                disabled={selectedIds.length === 0}
+                onClick={applyHeightToSelected}
+                title={
+                  heightPending && selectedIds.length > 0
+                    ? 'Height changed — click to apply to selected parts'
+                    : undefined
+                }
+              >
                 Selected parts ({selectedIds.length})
               </button>
             </div>
+            {heightPending && (selectedIds.length > 0 || (segmented?.regions.length ?? 0) > 0) ? (
+              <p className="muted tiny needs-apply-hint">
+                {selectedIds.length > 0
+                  ? 'Height edited — click Selected parts to update the 3D mesh.'
+                  : 'Height edited — click Change height · all parts to update the 3D mesh.'}
+              </p>
+            ) : null}
           </section>
 
           <section>
