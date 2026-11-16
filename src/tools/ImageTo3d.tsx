@@ -17,9 +17,11 @@ import {
 import { formatNum } from '../core/format';
 import {
   clearFineBackground,
+  collectTransparentBackground,
   countFineBgPixels,
   DEFAULT_PART_HEIGHT_MM,
   hitTestRegion,
+  imageHasTransparency,
   loadImageElement,
   pickWandRegion,
   reapplyWandPicks,
@@ -71,6 +73,27 @@ function formatStep(v: number, step: number): string {
 
 function formatCount(n: number): string {
   return Math.round(n).toLocaleString();
+}
+
+function mmFilenameToken(n: number, decimals: number): string {
+  if (decimals <= 0) return `${Math.round(n)}mm`;
+  return `${n.toFixed(decimals)}mm`;
+}
+
+/** `_80mm_80.00mm_1.60mm` — plate width, plate height, print (Z) height. */
+function modelSizeFilenameTag(widthMm: number, heightMm: number, printHeightMm: number): string {
+  return `_${mmFilenameToken(widthMm, 0)}_${mmFilenameToken(heightMm, 2)}_${mmFilenameToken(printHeightMm, 2)}`;
+}
+
+function printHeightFromParts(parts: ExtrudedPart[]): number {
+  let maxZ = 0;
+  for (const p of parts) {
+    if (!p.geometry.boundingBox) p.geometry.computeBoundingBox();
+    const z = p.geometry.boundingBox?.max.z ?? 0;
+    if (z > maxZ) maxZ = z;
+  }
+  if (maxZ > 0) return maxZ;
+  return Math.max(0, ...parts.map((p) => p.heightMm));
 }
 
 export default function ImageTo3d() {
@@ -132,6 +155,11 @@ export default function ImageTo3d() {
     () => (segmented ? modelSizeMm(segmented, widthMm) : null),
     [segmented, widthMm]
   );
+  const hasTransparency = useMemo(
+    () => (segmented ? imageHasTransparency(segmented) : false),
+    [segmented]
+  );
+  const hasTransparentBg = wandBgParts.some((p) => p.kind === 'alpha');
 
   const measuredMm = useMemo(() => {
     if (measurePoints.length < 2) return 0;
@@ -512,6 +540,45 @@ export default function ImageTo3d() {
     setStatus(`Outer white added · ${applied.segmented.regions.length} FG parts`);
   };
 
+  const applyTransparentBg = () => {
+    const raw = rawRef.current;
+    const live = segmentedRef.current;
+    if (!raw || !live) return;
+    if (wandBgPartsRef.current.some((p) => p.kind === 'alpha')) {
+      setStatus('Transparent BG is already set.');
+      return;
+    }
+    const found = collectTransparentBackground(live);
+    if (!found.part || found.part.pixelCount < 1) {
+      setStatus('Transparent BG: this image has no alpha holes.');
+      return;
+    }
+    const seed: WandBgPart = {
+      ...found.part,
+      id: `alpha-${Date.now().toString(36)}`,
+    };
+    const applied = reapplyWandPicks(
+      raw,
+      [...wandBgPartsRef.current, seed],
+      bgTolerance,
+      bgSmooth,
+      bgGrow,
+      segmentedRef.current?.regions
+    );
+    const added = applied.parts.find((p) => p.id === seed.id);
+    if (!added || added.pixelCount < 1) {
+      setStatus('Transparent BG: this image has no alpha holes.');
+      return;
+    }
+    wandBgPartsRef.current = applied.parts;
+    segmentedRef.current = applied.segmented;
+    setWandBgParts(applied.parts);
+    setActiveWandId(seed.id);
+    setSegmented(applied.segmented);
+    setSelectedIds([]);
+    setStatus(`Transparent BG added · ${applied.segmented.regions.length} FG parts`);
+  };
+
   const restoreBgPart = (partId: string) => {
     const raw = rawRef.current;
     if (!raw) return;
@@ -658,8 +725,12 @@ export default function ImageTo3d() {
         segmented?.name.replace(/\.[^.]+$/, '') || 'logo'
       );
       const base = segmented?.name.replace(/\.[^.]+$/, '') || 'logo';
-      download3mf(data, `${base}_image3d.3mf`);
-      setStatus(`Exported ${extruded.length} parts → ${base}_image3d.3mf`);
+      const w = size?.widthMm ?? widthMm;
+      const h = size?.heightMm ?? w;
+      const z = printHeightFromParts(extruded);
+      const filename = `${base}_image3d${modelSizeFilenameTag(w, h, z)}.3mf`;
+      download3mf(data, filename);
+      setStatus(`Exported ${extruded.length} parts → ${filename}`);
     } catch (err) {
       setStatus(`Export error: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -732,6 +803,20 @@ export default function ImageTo3d() {
               </button>
               <button type="button" disabled={!segmented || busy} onClick={applyOuterWhiteBg}>
                 Outer white
+              </button>
+              <button
+                type="button"
+                disabled={!segmented || busy || !hasTransparency || hasTransparentBg}
+                onClick={applyTransparentBg}
+                title={
+                  !hasTransparency
+                    ? 'This image has no transparent pixels'
+                    : hasTransparentBg
+                      ? 'Transparent pixels are already the background'
+                      : 'Use PNG/GIF alpha as background and build the 3D preview'
+                }
+              >
+                Transparent BG
               </button>
             </div>
             <label>
@@ -851,7 +936,9 @@ export default function ImageTo3d() {
             </p>
             <h3 className="subhead">BG parts ({wandBgParts.length})</h3>
             {wandBgParts.length === 0 ? (
-              <p className="muted tiny">No wand picks yet — click the source image.</p>
+              <p className="muted tiny">
+                No wand picks yet — click the source, or Transparent BG for PNG alpha.
+              </p>
             ) : (
               <ul className="color-list wand-bg-list">
                 {[...wandBgParts].reverse().map((p) => (
@@ -868,7 +955,7 @@ export default function ImageTo3d() {
                       <span className="part-info">
                         <span className="part-name">{p.name}</span>
                         <span className="muted tiny mono">
-                          {p.hex} · {formatCount(p.pixelCount)} px
+                          {p.kind === 'alpha' ? 'alpha' : p.hex} · {formatCount(p.pixelCount)} px
                         </span>
                       </span>
                     </button>

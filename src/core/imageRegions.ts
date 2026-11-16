@@ -162,8 +162,8 @@ export function rasterizeImage(
   canvas.width = w;
   canvas.height = h;
   const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(0, 0, w, h);
+  // Keep PNG alpha. Filling white first made white-on-transparent logos invisible.
+  ctx.clearRect(0, 0, w, h);
   ctx.imageSmoothingEnabled = scale < 1;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(img, 0, 0, w, h);
@@ -679,17 +679,19 @@ export function renderRegionPreview(
         out.data[o] = 255;
         out.data[o + 1] = hi ? 105 : 140;
         out.data[o + 2] = hi ? 180 : 200;
+        out.data[o + 3] = 255;
       } else {
         out.data[o] = src[so];
         out.data[o + 1] = src[so + 1];
         out.data[o + 2] = src[so + 2];
+        out.data[o + 3] = src[so + 3];
         if (selected.some((r) => regionHasPixel(r, x, y))) {
           out.data[o] = 34;
           out.data[o + 1] = 197;
           out.data[o + 2] = 94;
+          out.data[o + 3] = 255;
         }
       }
-      out.data[o + 3] = 255;
     }
   }
 
@@ -770,7 +772,55 @@ export interface WandBgPart {
   /** Working-image click. Used to re-flood when tolerance / smooth / grow change. */
   seedX: number;
   seedY: number;
-  kind: 'click' | 'outer';
+  kind: 'click' | 'outer' | 'alpha';
+}
+
+const ALPHA_BG = 20;
+
+function pixelIsTransparent(seg: SegmentedImage, i: number): boolean {
+  if (seg.labelMap[i] < 0) return true;
+  return seg.imageData.data[i * 4 + 3] < ALPHA_BG;
+}
+
+/** True when the upload has PNG / GIF alpha holes. */
+export function imageHasTransparency(seg: SegmentedImage): boolean {
+  for (let i = 0; i < seg.labelMap.length; i++) {
+    if (pixelIsTransparent(seg, i)) return true;
+  }
+  return false;
+}
+
+/**
+ * Mark every transparent pixel as a named BG part so 3D can build without
+ * wand-clicking empty alpha (clicks there are already BG and do nothing).
+ */
+export function collectTransparentBackground(
+  segmented: SegmentedImage
+): { segmented: SegmentedImage; part: WandBgPart | null } {
+  const n = segmented.width * segmented.height;
+  const bgMask = new Uint8Array(segmented.bgMask);
+  const partMask = new Uint8Array(n);
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    if (!pixelIsTransparent(segmented, i)) continue;
+    partMask[i] = 1;
+    bgMask[i] = 1;
+    count++;
+  }
+  if (count < 1) return { segmented, part: null };
+  return {
+    segmented: withRebuiltRegions(segmented, { bgMask }),
+    part: {
+      id: newId(),
+      name: 'Transparent',
+      hex: 'clear',
+      pixelCount: count,
+      mask: partMask,
+      seedX: -1,
+      seedY: -1,
+      kind: 'alpha',
+    },
+  };
 }
 
 function luminance(r: number, g: number, b: number): number {
@@ -840,6 +890,7 @@ function unionSealedWall(
   const data = raw.imageData.data;
   const white: Rgba = { r: 255, g: 255, b: 255, a: 255 };
   for (const pick of picks) {
+    if (pick.kind === 'alpha') continue;
     let seed = white;
     let seedIndex = -1;
     if (pick.kind === 'click') {
@@ -1306,6 +1357,20 @@ export function reapplyWandPicks(
       });
       continue;
     }
+    if (pick.kind === 'alpha') {
+      const flooded = collectTransparentBackground(current);
+      current = flooded.segmented;
+      const mask = flooded.part?.mask ?? new Uint8Array(raw.width * raw.height);
+      let count = 0;
+      for (let i = 0; i < mask.length; i++) if (mask[i]) count++;
+      parts.push({
+        ...pick,
+        hex: 'clear',
+        mask,
+        pixelCount: count,
+      });
+      continue;
+    }
 
     const picked = pickWandRegion(current, pick.seedX, pick.seedY, tolerance);
     if (!picked) {
@@ -1346,6 +1411,7 @@ export function reapplyWandPicks(
       seeds.push({ x: part.seedX, y: part.seedY });
       continue;
     }
+    if (part.kind !== 'outer') continue;
     for (let x = 0; x < raw.width; x++) {
       seeds.push({ x, y: 0 }, { x, y: raw.height - 1 });
     }
@@ -1353,7 +1419,14 @@ export function reapplyWandPicks(
       seeds.push({ x: 0, y }, { x: raw.width - 1, y });
     }
   }
-  bgMask = retainReachableBackground(bgMask, wall, raw.width, raw.height, seeds);
+  // Empty seeds (Transparent-only) would wipe the whole mask. Keep click/outer
+  // floods reachable, then force PNG alpha back on so it stays a listed part.
+  if (seeds.length > 0) {
+    bgMask = retainReachableBackground(bgMask, wall, raw.width, raw.height, seeds);
+  }
+  for (let i = 0; i < bgMask.length; i++) {
+    if (raw.labelMap[i] < 0) bgMask[i] = 1;
+  }
 
   const owner = new Int16Array(bgMask.length).fill(-1);
   parts.forEach((part, pi) => {
@@ -1366,9 +1439,18 @@ export function reapplyWandPicks(
     .filter((s) => s.kind === 'click');
   for (let i = 0; i < bgMask.length; i++) {
     if (!bgMask[i] || owner[i] >= 0) continue;
+    if (raw.labelMap[i] < 0) {
+      const alpha = parts.findIndex((p) => p.kind === 'alpha');
+      if (alpha >= 0) {
+        owner[i] = alpha;
+        continue;
+      }
+    }
     if (clicks.length === 0) {
       const outer = parts.findIndex((p) => p.kind === 'outer');
+      const alpha = parts.findIndex((p) => p.kind === 'alpha');
       if (outer >= 0) owner[i] = outer;
+      else if (alpha >= 0) owner[i] = alpha;
       continue;
     }
     const x = i % raw.width;
@@ -1396,10 +1478,6 @@ export function reapplyWandPicks(
     parts[pi] = { ...parts[pi], mask, pixelCount: count };
   }
 
-  // Keep transparent pixels as background
-  for (let i = 0; i < bgMask.length; i++) {
-    if (raw.labelMap[i] < 0) bgMask[i] = 1;
-  }
   const segmented = withRebuiltRegions(freshBackground(raw), {
     bgMask: new Uint8Array(bgMask),
     regions: prevRegions ?? raw.regions,

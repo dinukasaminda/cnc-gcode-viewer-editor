@@ -814,6 +814,10 @@ label select {
   cursor: crosshair;
   image-rendering: auto;
   transform-origin: 0 0;
+  /* Mid-tone checker so white-on-transparent and black-on-transparent both read. */
+  background-color: #3a4452;
+  background-image: repeating-conic-gradient(#2a3340 0% 25%, #4a5564 0% 50%);
+  background-size: 14px 14px;
 }
 
 .image-preview.bg-pick {
