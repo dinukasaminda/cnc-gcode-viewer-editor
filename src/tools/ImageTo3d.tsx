@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   MeshViewer3D,
   type MeasureMode,
+  type MeasureOverlayLine,
   type MeasurePoint,
   type SurfaceHitEvent,
 } from '../components/MeshViewer3D';
@@ -9,7 +10,10 @@ import { NumberInput } from '../components/NumberInput';
 import {
   buildExtrudedParts,
   disposeExtruded,
+  foregroundPixelBox,
   modelSizeMm,
+  partsBoundingMm,
+  syncExtrudedParts,
   updateRegion,
   type ExtrudedPart,
   type ExtrudeSettings,
@@ -17,13 +21,13 @@ import {
 import { formatNum } from '../core/format';
 import {
   clearFineBackground,
+  appendWandClickPick,
   collectTransparentBackground,
   countFineBgPixels,
   DEFAULT_PART_HEIGHT_MM,
   hitTestRegion,
   imageHasTransparency,
   loadImageElement,
-  pickWandRegion,
   reapplyWandPicks,
   renderRegionPreview,
   segmentImage,
@@ -80,20 +84,30 @@ function mmFilenameToken(n: number, decimals: number): string {
   return `${n.toFixed(decimals)}mm`;
 }
 
-/** `_80mm_80.00mm_1.60mm` — plate width, plate height, print (Z) height. */
+/** `_80mm_80.00mm_1.00mm` — plate width, plate height, print (Z) height. */
 function modelSizeFilenameTag(widthMm: number, heightMm: number, printHeightMm: number): string {
   return `_${mmFilenameToken(widthMm, 0)}_${mmFilenameToken(heightMm, 2)}_${mmFilenameToken(printHeightMm, 2)}`;
 }
 
-function printHeightFromParts(parts: ExtrudedPart[]): number {
+function modelPrintHeightMm(
+  seg: SegmentedImage | null,
+  settings: ExtrudeSettings,
+  parts: ExtrudedPart[]
+): number {
+  const z0 = settings.baseEnabled && settings.baseHeightMm > 0 ? settings.baseHeightMm : 0;
+  if (seg) {
+    const maxH = Math.max(
+      0,
+      ...seg.regions.filter((r) => r.enabled).map((r) => r.heightMm)
+    );
+    if (maxH > 0) return z0 + maxH;
+  }
   let maxZ = 0;
   for (const p of parts) {
-    if (!p.geometry.boundingBox) p.geometry.computeBoundingBox();
-    const z = p.geometry.boundingBox?.max.z ?? 0;
-    if (z > maxZ) maxZ = z;
+    if (p.id === 'base') continue;
+    if (p.heightMm > maxZ) maxZ = p.heightMm;
   }
-  if (maxZ > 0) return maxZ;
-  return Math.max(0, ...parts.map((p) => p.heightMm));
+  return z0 + maxZ;
 }
 
 export default function ImageTo3d() {
@@ -104,6 +118,7 @@ export default function ImageTo3d() {
   const [baseHeightMm, setBaseHeightMm] = useState(1);
   const [smoothEdges, setSmoothEdges] = useState(true);
   const [rightTab, setRightTab] = useState<'parts' | 'advanced'>('parts');
+  const [stageTab, setStageTab] = useState<'canvas' | '3d'>('canvas');
   const [partMode, setPartModeState] = useState<PartMode>('color');
   const partModeRef = useRef<PartMode>('color');
   const [outlineDraft, setOutlineDraft] = useState<OutlineOptions>(DEFAULT_OUTLINE_OPTIONS);
@@ -142,6 +157,7 @@ export default function ImageTo3d() {
   const rawRef = useRef<SegmentedImage | null>(null);
   const wandBgPartsRef = useRef<WandBgPart[]>([]);
   const ingestGenRef = useRef(0);
+  const meshJobRef = useRef(0);
 
   // Sync refs after commit only — never overwrite mid-click during render
   useEffect(() => {
@@ -178,6 +194,8 @@ export default function ImageTo3d() {
     }),
     [widthMm, baseHeightMm, baseEnabled, smoothEdges, outlineOpts]
   );
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   // Rebuild once the slider settles, not on every drag tick.
   useEffect(() => {
@@ -264,7 +282,12 @@ export default function ImageTo3d() {
       ro.disconnect();
       wrap.removeEventListener('wheel', onWheel);
     };
-  }, [activeTool]);
+  }, [activeTool, segmented, stageTab]);
+
+  useEffect(() => {
+    if (stageTab !== 'canvas') return;
+    fitSourceImage();
+  }, [stageTab]);
 
   const rebuildMesh = useCallback(
     (seg: SegmentedImage, extrude: ExtrudeSettings) => {
@@ -276,6 +299,15 @@ export default function ImageTo3d() {
     },
     []
   );
+
+  const queueFullMesh = (seg: SegmentedImage, delay = 0) => {
+    const job = ++meshJobRef.current;
+    const extrude = settingsRef.current;
+    window.setTimeout(() => {
+      if (job !== meshJobRef.current) return;
+      rebuildMesh(seg, extrude);
+    }, delay);
+  };
 
   const ingestImage = useCallback(
     async (img: HTMLImageElement, name: string) => {
@@ -334,23 +366,30 @@ export default function ImageTo3d() {
     rebuildPreview(segmented, selectedIds, wandBgParts, activeWandId);
   }, [segmented, selectedIds, wandBgParts, activeWandId, activeTool, rebuildPreview]);
 
-  // Build 3D only after the user has wand-marked at least one BG region.
+  // Full 3D rebuild when size / smooth / base change. Wand hole-clicks update
+  // meshes incrementally so a large image does not remesh on every pick.
   useEffect(() => {
-    if (!segmented) return;
-    if (wandBgParts.length === 0) {
-      setExtruded((prev) => {
-        if (prev.length === 0) return prev;
-        disposeExtruded(prev);
-        return [];
-      });
-      return;
-    }
+    if (wandBgPartsRef.current.length === 0) return;
+    const job = ++meshJobRef.current;
     const t = window.setTimeout(() => {
-      rebuildMesh(segmented, settings);
+      if (job !== meshJobRef.current) return;
+      const seg = segmentedRef.current;
+      if (!seg || wandBgPartsRef.current.length === 0) return;
+      rebuildMesh(seg, settings);
       setMeasurePoints([]);
-    }, 120);
+    }, 180);
     return () => window.clearTimeout(t);
-  }, [segmented, settings, wandBgParts.length, rebuildMesh]);
+  }, [settings, rebuildMesh]);
+
+  useEffect(() => {
+    if (wandBgParts.length > 0) return;
+    meshJobRef.current++;
+    setExtruded((prev) => {
+      if (prev.length === 0) return prev;
+      disposeExtruded(prev);
+      return [];
+    });
+  }, [wandBgParts.length]);
 
   // Re-flood the same click points when wand tolerance / smooth / grow change.
   useEffect(() => {
@@ -363,6 +402,7 @@ export default function ImageTo3d() {
       segmentedRef.current = applied.segmented;
       setWandBgParts(applied.parts);
       setSegmented(applied.segmented);
+      rebuildMesh(applied.segmented, settingsRef.current);
       setStatus(
         `Wand rebuilt from ${applied.parts.length} click(s) · tol ${bgTolerance} · smooth ${bgSmooth} · grow ${bgGrow}`
       );
@@ -373,6 +413,7 @@ export default function ImageTo3d() {
   const startMeasure = () => {
     setMeasureMode('line');
     setMeasurePoints([]);
+    setStageTab('3d');
     setStatus('Measure: click two points on the model (distance in mm).');
   };
 
@@ -429,33 +470,19 @@ export default function ImageTo3d() {
     const y = ((e.clientY - rect.top) / rect.height) * seg.height;
 
     if (activeTool === 'wand') {
-      const raw = rawRef.current;
-      if (!raw) return;
-      if (!pickWandRegion(seg, x, y, bgTolerance)) {
-        setStatus('Wand: nothing new here (already BG or too small).');
-        return;
-      }
       const id = `bg-${Date.now().toString(36)}-${wandBgPartsRef.current.length}`;
-      const seed: WandBgPart = {
-        id,
-        name: `BG ${wandBgPartsRef.current.length + 1}`,
-        hex: '#ffffff',
-        pixelCount: 0,
-        mask: new Uint8Array(0),
-        seedX: x,
-        seedY: y,
-        kind: 'click',
-      };
-      const applied = reapplyWandPicks(
-        raw,
-        [...wandBgPartsRef.current, seed],
+      const applied = appendWandClickPick(
+        seg,
+        wandBgPartsRef.current,
+        x,
+        y,
         bgTolerance,
         bgSmooth,
         bgGrow,
-        segmentedRef.current?.regions
+        id,
+        `BG ${wandBgPartsRef.current.length + 1}`
       );
-      const added = applied.parts.find((p) => p.id === id);
-      if (!added || added.pixelCount < 1) {
+      if (!applied) {
         setStatus('Wand: nothing new here (already BG or too small).');
         return;
       }
@@ -465,9 +492,27 @@ export default function ImageTo3d() {
       setActiveWandId(id);
       setSegmented(applied.segmented);
       setSelectedIds([]);
+      rebuildPreview(applied.segmented, [], applied.parts, id);
       setStatus(
-        `Wand BG +1 · ${added.name} · ${formatCount(added.pixelCount)} px · list ${applied.parts.length}`
+        `Wand BG +1 · ${applied.added.name} · ${formatCount(applied.added.pixelCount)} px · list ${applied.parts.length}`
       );
+      const job = ++meshJobRef.current;
+      const nextSeg = applied.segmented;
+      const removed = applied.removedRegionIds;
+      const changed = applied.changedRegionIds;
+      const extrude = settingsRef.current;
+      const prevBodyW = foregroundPixelBox(seg)?.widthPx;
+      const nextBodyW = foregroundPixelBox(nextSeg)?.widthPx;
+      window.setTimeout(() => {
+        if (job !== meshJobRef.current) return;
+        setExtruded((prev) => {
+          if (prev.length === 0 || prevBodyW !== nextBodyW) {
+            if (prev.length > 0) disposeExtruded(prev);
+            return buildExtrudedParts(nextSeg, extrude);
+          }
+          return syncExtrudedParts(prev, nextSeg, extrude, removed, changed);
+        });
+      }, 0);
       return;
     }
 
@@ -482,17 +527,19 @@ export default function ImageTo3d() {
 
   const useWandTool = () => {
     setActiveTool('wand');
-    setStatus('Tool: Wand — click the source image to mark BG regions (pink).');
+    setStageTab('canvas');
+    setStatus('Tool: Wand — click the Canvas tab to mark BG regions (pink).');
   };
 
   const useHandTool = () => {
     setActiveTool('hand');
-    setStatus('Tool: Hand — drag to pan the source image, scroll to zoom.');
+    setStageTab('canvas');
+    setStatus('Tool: Hand — drag to pan the canvas, scroll to zoom.');
   };
 
   const usePartTool = () => {
     setActiveTool('part');
-    setStatus('Tool: Select parts — click list / preview / 3D (green).');
+    setStatus('Tool: Select parts — click list / Canvas / 3D (green).');
   };
 
   const togglePartSelection = (partId: string, multi: boolean) => {
@@ -537,7 +584,9 @@ export default function ImageTo3d() {
     setActiveWandId(seed.id);
     setSegmented(applied.segmented);
     setSelectedIds([]);
+    rebuildPreview(applied.segmented, [], applied.parts, seed.id);
     setStatus(`Outer white added · ${applied.segmented.regions.length} FG parts`);
+    queueFullMesh(applied.segmented);
   };
 
   const applyTransparentBg = () => {
@@ -576,7 +625,9 @@ export default function ImageTo3d() {
     setActiveWandId(seed.id);
     setSegmented(applied.segmented);
     setSelectedIds([]);
+    rebuildPreview(applied.segmented, [], applied.parts, seed.id);
     setStatus(`Transparent BG added · ${applied.segmented.regions.length} FG parts`);
+    queueFullMesh(applied.segmented);
   };
 
   const restoreBgPart = (partId: string) => {
@@ -602,6 +653,7 @@ export default function ImageTo3d() {
     setActiveWandId(applied.parts[0]?.id ?? null);
     setSegmented(applied.segmented);
     setStatus(`Restored ${part.name} as foreground · ${applied.segmented.regions.length} FG parts`);
+    queueFullMesh(applied.segmented);
   };
 
   const resetFineBg = () => {
@@ -622,14 +674,16 @@ export default function ImageTo3d() {
       ? segmented.regions.find((r) => r.id === selectedIds[0]) ?? null
       : null;
 
-  const patchSelectedHeight = (heightMm: number) => {
+  const patchSelectedHeight = (heightMm: number, remeshDelay = 180) => {
     if (!segmented || selectedIds.length === 0) return;
     let regions = segmented.regions;
     for (const id of selectedIds) {
       regions = updateRegion(regions, id, { heightMm });
     }
     const next = { ...segmented, regions };
+    segmentedRef.current = next;
     setSegmented(next);
+    queueFullMesh(next, remeshDelay);
   };
 
   const applyHeightToAll = () => {
@@ -652,6 +706,7 @@ export default function ImageTo3d() {
     setSegmented(next);
     setHeightPending(false);
     setStatus(`Height ${formatNum(h)} mm → all ${next.regions.length} parts`);
+    queueFullMesh(next);
   };
 
   const changePartMode = (mode: PartMode) => {
@@ -691,7 +746,7 @@ export default function ImageTo3d() {
 
   const applyHeightToSelected = () => {
     if (selectedIds.length === 0) return;
-    patchSelectedHeight(partHeightMm);
+    patchSelectedHeight(partHeightMm, 0);
     setHeightPending(false);
     setStatus(`Height ${formatNum(partHeightMm)} mm → ${selectedIds.length} selected part(s)`);
   };
@@ -727,7 +782,7 @@ export default function ImageTo3d() {
       const base = segmented?.name.replace(/\.[^.]+$/, '') || 'logo';
       const w = size?.widthMm ?? widthMm;
       const h = size?.heightMm ?? w;
-      const z = printHeightFromParts(extruded);
+      const z = modelPrintHeightMm(segmented, settings, extruded);
       const filename = `${base}_image3d${modelSizeFilenameTag(w, h, z)}.3mf`;
       download3mf(data, filename);
       setStatus(`Exported ${extruded.length} parts → ${filename}`);
@@ -745,6 +800,74 @@ export default function ImageTo3d() {
       })),
     [extruded, selectedIds]
   );
+
+  const bodySize = useMemo(() => partsBoundingMm(extruded), [extruded]);
+
+  const sizeOverlays = useMemo((): MeasureOverlayLine[] => {
+    if (!bodySize) return [];
+    const { minX, minY, minZ, maxX, maxY, maxZ, widthMm: w, depthMm: d, heightMm: printH } = bodySize;
+    const gap = Math.max(2.4, Math.min(w, d) * 0.07);
+    const zLine = Math.max(minZ, 0) + 0.08;
+    const yFront = minY - gap;
+    const xLeft = minX - gap;
+    const lines: MeasureOverlayLine[] = [
+      {
+        a: { x: minX, y: yFront, z: zLine },
+        b: { x: maxX, y: yFront, z: zLine },
+        color: 0xf5c518,
+        label: `model width ${formatNum(widthMm)} mm`,
+      },
+      {
+        a: { x: minX, y: minY, z: zLine },
+        b: { x: minX, y: yFront, z: zLine },
+        color: 0xf5c518,
+        showEnds: false,
+      },
+      {
+        a: { x: maxX, y: minY, z: zLine },
+        b: { x: maxX, y: yFront, z: zLine },
+        color: 0xf5c518,
+        showEnds: false,
+      },
+      {
+        a: { x: xLeft, y: minY, z: zLine },
+        b: { x: xLeft, y: maxY, z: zLine },
+        color: 0x7dd3fc,
+        label: `depth ${formatNum(d)} mm`,
+      },
+      {
+        a: { x: minX, y: minY, z: zLine },
+        b: { x: xLeft, y: minY, z: zLine },
+        color: 0x7dd3fc,
+        showEnds: false,
+      },
+      {
+        a: { x: minX, y: maxY, z: zLine },
+        b: { x: xLeft, y: maxY, z: zLine },
+        color: 0x7dd3fc,
+        showEnds: false,
+      },
+    ];
+    if (printH > 0.05) {
+      const xh = minX;
+      const yh = maxY + gap * 0.35;
+      lines.push(
+        {
+          a: { x: xh, y: yh, z: minZ },
+          b: { x: xh, y: yh, z: maxZ },
+          color: 0xa3e635,
+          label: `height ${formatNum(printH)} mm`,
+        },
+        {
+          a: { x: xh, y: maxY, z: maxZ },
+          b: { x: xh, y: yh, z: maxZ },
+          color: 0xa3e635,
+          showEnds: false,
+        }
+      );
+    }
+    return lines;
+  }, [bodySize, widthMm]);
 
   const totalTris = extruded.reduce((s, p) => s + p.triangleCount, 0);
 
@@ -876,68 +999,26 @@ export default function ImageTo3d() {
 
           <section>
             <h2>Source</h2>
-            <div
-              ref={previewWrapRef}
-              className={activeTool === 'hand' ? 'image-preview-wrap hand-view' : 'image-preview-wrap'}
-              onPointerDown={(e) => {
-                if (activeTool !== 'hand') return;
-                panDrag.current = {
-                  px: e.clientX,
-                  py: e.clientY,
-                  x: imgViewRef.current.x,
-                  y: imgViewRef.current.y,
-                };
-                (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-              }}
-              onPointerMove={(e) => {
-                if (!panDrag.current || activeTool !== 'hand') return;
-                const next = {
-                  x: panDrag.current.x + (e.clientX - panDrag.current.px),
-                  y: panDrag.current.y + (e.clientY - panDrag.current.py),
-                };
-                imgViewRef.current = { ...imgViewRef.current, ...next };
-                setImgPan(next);
-              }}
-              onPointerUp={() => {
-                panDrag.current = null;
-              }}
-              onDoubleClick={() => {
-                if (activeTool === 'hand') resetSourceView();
-              }}
-            >
-              <canvas
-                ref={previewRef}
-                className={
-                  activeTool === 'wand'
-                    ? 'image-preview bg-pick'
-                    : activeTool === 'hand'
-                      ? 'image-preview hand-tool'
-                      : 'image-preview'
-                }
-                style={{
-                  transform: `translate(${imgPan.x}px, ${imgPan.y}px) scale(${imgZoom})`,
-                }}
-                onClick={onPreviewClick}
-                title={
-                  activeTool === 'hand'
-                    ? 'Hand: drag to pan, scroll to zoom, double-click to reset'
-                    : activeTool === 'wand'
-                      ? 'Wand tool: click a closed region to mark BG'
-                      : 'Part tool: click a closed part to select'
-                }
-              />
+            <div className="row-actions">
+              <button
+                type="button"
+                className={stageTab === 'canvas' ? 'primary' : ''}
+                onClick={() => setStageTab('canvas')}
+              >
+                Open Canvas tab
+              </button>
             </div>
             <p className="muted tiny">
               {activeTool === 'hand'
-                ? 'Hand — drag to pan, scroll to zoom, double-click to fit.'
+                ? 'Hand — use the Canvas tab: drag to pan, scroll to zoom, double-click to fit.'
                 : activeTool === 'wand'
-                  ? 'Click closed areas (pink). 3D preview appears after the first BG pick.'
-                  : 'Select parts is on — use the right list / 3D (green).'}
+                  ? 'Use the Canvas tab (center) to click closed areas (pink). Switch to 3D after BG picks.'
+                  : 'Select parts is on — click Canvas or 3D (green).'}
             </p>
             <h3 className="subhead">BG parts ({wandBgParts.length})</h3>
             {wandBgParts.length === 0 ? (
               <p className="muted tiny">
-                No wand picks yet — click the source, or Transparent BG for PNG alpha.
+                No wand picks yet — use the Canvas tab, or Transparent BG for PNG alpha.
               </p>
             ) : (
               <ul className="color-list wand-bg-list">
@@ -982,14 +1063,23 @@ export default function ImageTo3d() {
 
           <section>
             <h2>Dimensions</h2>
-            <label>
+            <label title="Left-to-right size of the 3D solid — the yellow ruler.">
               Model width (mm)
               <NumberInput step={1} min={5} max={500} value={widthMm} onChange={setWidthMm} />
             </label>
+            <p className="muted tiny">
+              This value is the yellow ruler: left → right of the solid. Blue is depth (aspect of
+              the solid); green is print height.
+            </p>
+            {bodySize && (
+              <p className="muted tiny mono">
+                3D body {formatNum(bodySize.widthMm)} × {formatNum(bodySize.depthMm)} ×{' '}
+                {formatNum(bodySize.heightMm)} mm
+              </p>
+            )}
             {size && segmented && (
               <p className="muted tiny mono">
-                Plate {formatNum(size.widthMm)} × {formatNum(size.heightMm)} mm · px{' '}
-                {formatNum(size.pixelMm, 3)} mm · {segmented.sourceWidth}×{segmented.sourceHeight}
+                1 px {formatNum(size.pixelMm, 3)} mm · {segmented.sourceWidth}×{segmented.sourceHeight}
                 {segmented.downsample < 0.999 ? ` → ${segmented.width}×${segmented.height}` : ' original'}
               </p>
             )}
@@ -1065,38 +1155,133 @@ export default function ImageTo3d() {
         />
 
         <main className="viewport-wrap">
+          <div className="stage-tabs" role="tablist" aria-label="Center view">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={stageTab === 'canvas'}
+              className={stageTab === 'canvas' ? 'active' : ''}
+              onClick={() => setStageTab('canvas')}
+            >
+              Canvas
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={stageTab === '3d'}
+              className={stageTab === '3d' ? 'active' : ''}
+              onClick={() => setStageTab('3d')}
+            >
+              3D
+            </button>
+          </div>
           <div className="viewport-stage">
-            {wandBgParts.length === 0 ? (
-              <div className="stage-photo-wrap">
-                <p className="muted">
-                  Open an image and wand-pick background
-                  <br />
-                  to build the 3D preview.
-                </p>
+            <div className={stageTab === 'canvas' ? 'stage-layer is-on' : 'stage-layer is-off'}>
+              {segmented ? (
+                <div
+                  ref={previewWrapRef}
+                  className={
+                    activeTool === 'hand'
+                      ? 'image-preview-wrap stage-canvas hand-view'
+                      : 'image-preview-wrap stage-canvas'
+                  }
+                  onPointerDown={(e) => {
+                    if (activeTool !== 'hand') return;
+                    panDrag.current = {
+                      px: e.clientX,
+                      py: e.clientY,
+                      x: imgViewRef.current.x,
+                      y: imgViewRef.current.y,
+                    };
+                    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                  }}
+                  onPointerMove={(e) => {
+                    if (!panDrag.current || activeTool !== 'hand') return;
+                    const next = {
+                      x: panDrag.current.x + (e.clientX - panDrag.current.px),
+                      y: panDrag.current.y + (e.clientY - panDrag.current.py),
+                    };
+                    imgViewRef.current = { ...imgViewRef.current, ...next };
+                    setImgPan(next);
+                  }}
+                  onPointerUp={() => {
+                    panDrag.current = null;
+                  }}
+                  onDoubleClick={() => {
+                    if (activeTool === 'hand') resetSourceView();
+                  }}
+                >
+                  <canvas
+                    ref={previewRef}
+                    className={
+                      activeTool === 'wand'
+                        ? 'image-preview bg-pick'
+                        : activeTool === 'hand'
+                          ? 'image-preview hand-tool'
+                          : 'image-preview'
+                    }
+                    style={{
+                      transform: `translate(${imgPan.x}px, ${imgPan.y}px) scale(${imgZoom})`,
+                    }}
+                    onClick={onPreviewClick}
+                    title={
+                      activeTool === 'hand'
+                        ? 'Hand: drag to pan, scroll to zoom, double-click to reset'
+                        : activeTool === 'wand'
+                          ? 'Wand tool: click a closed region to mark BG'
+                          : 'Part tool: click a closed part to select'
+                    }
+                  />
+                </div>
+              ) : (
+                <div className="stage-photo-wrap">
+                  <p className="muted">
+                    Open an image, then use Wand on this canvas
+                    <br />
+                    to mark background and foreground.
+                  </p>
+                </div>
+              )}
+            </div>
+            <div className={stageTab === '3d' ? 'stage-layer is-on' : 'stage-layer is-off'}>
+              {wandBgParts.length === 0 ? (
+                <div className="stage-photo-wrap">
+                  <p className="muted">
+                    Open an image and wand-pick background
+                    <br />
+                    on the Canvas tab to build the 3D preview.
+                  </p>
+                </div>
+              ) : (
+                <MeshViewer3D
+                  parts={viewerParts}
+                  wireframe={wireframe}
+                  resetKey={resetKey}
+                  pickEnabled={!busy && (activeTool === 'part' || measureMode !== 'off')}
+                  measureMode={measureMode}
+                  measurePoints={measurePoints}
+                  measureOverlays={sizeOverlays}
+                  upAxis="z"
+                  bedColor={bedColor}
+                  onSurfaceHit={onSurfaceHit}
+                  onPartClick={(ev) => {
+                    if (measureMode !== 'off' || activeTool !== 'part') return;
+                    togglePartSelection(
+                      ev.partId,
+                      ev.shiftKey || ev.metaKey || ev.ctrlKey
+                    );
+                  }}
+                />
+              )}
+            </div>
+            {stageTab === 'canvas' && activeTool === 'wand' && (
+              <div className="measure-banner tool-banner-wand">
+                Canvas — wand click closed areas for BG (pink) · then switch to 3D
               </div>
-            ) : (
-              <MeshViewer3D
-                parts={viewerParts}
-                wireframe={wireframe}
-                resetKey={resetKey}
-                pickEnabled={!busy && (activeTool === 'part' || measureMode !== 'off')}
-                measureMode={measureMode}
-                measurePoints={measurePoints}
-                upAxis="z"
-                bedColor={bedColor}
-                onSurfaceHit={onSurfaceHit}
-                onPartClick={(ev) => {
-                  if (measureMode !== 'off' || activeTool !== 'part') return;
-                  togglePartSelection(
-                    ev.partId,
-                    ev.shiftKey || ev.metaKey || ev.ctrlKey
-                  );
-                }}
-              />
             )}
             {activeTool === 'part' && measureMode === 'off' && wandBgParts.length > 0 && (
               <div className="measure-banner tool-banner-part">
-                Select parts active — click list / 3D (green) · Wand is off
+                Select parts active — click list / Canvas / 3D (green) · Wand is off
               </div>
             )}
             {measureMode !== 'off' && (
@@ -1184,7 +1369,7 @@ export default function ImageTo3d() {
                 Reset to defaults
               </button>
               <p className="muted tiny">
-                1 px ≈ {segmented ? formatNum(widthMm / segmented.width, 2) : '–'} mm. Double-click a slider to reset it.
+                1 px ≈ {size ? formatNum(size.pixelMm, 2) : '–'} mm. Double-click a slider to reset it.
               </p>
             </section>
           ) : (

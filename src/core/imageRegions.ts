@@ -85,9 +85,20 @@ export function rgbaToHex(c: Rgba): string {
 }
 
 function colorDist(a: Rgba, b: Rgba): number {
-  const dr = a.r - b.r;
-  const dg = a.g - b.g;
-  const db = a.b - b.b;
+  return colorDistRgb(a.r, a.g, a.b, b.r, b.g, b.b);
+}
+
+function colorDistRgb(
+  r1: number,
+  g1: number,
+  b1: number,
+  r2: number,
+  g2: number,
+  b2: number
+): number {
+  const dr = r1 - r2;
+  const dg = g1 - g2;
+  const db = b1 - b2;
   return Math.sqrt(dr * dr + dg * dg + db * db);
 }
 
@@ -845,9 +856,11 @@ function sealedWall(
   const inkDist = Math.max(22, tolerance * 0.65);
   for (let i = 0; i < width * height; i++) {
     const o = i * 4;
-    const c: Rgba = { r: data[o], g: data[o + 1], b: data[o + 2], a: 255 };
-    const lum = luminance(c.r, c.g, c.b);
-    if (seedLum - lum >= 42 && colorDist(c, seed) > inkDist) wall[i] = 1;
+    const r = data[o];
+    const g = data[o + 1];
+    const b = data[o + 2];
+    const lum = luminance(r, g, b);
+    if (seedLum - lum >= 42 && colorDistRgb(r, g, b, seed.r, seed.g, seed.b) > inkDist) wall[i] = 1;
   }
   let closed = wall;
   for (let i = 0; i < 2; i++) closed = new Uint8Array(dilateMask(closed, width, height));
@@ -871,10 +884,78 @@ function sealedWall(
       for (const nb of neighbors) {
         if (nb < 0 || !closed[nb] || wall[nb]) continue;
         const o = nb * 4;
-        const c: Rgba = { r: data[o], g: data[o + 1], b: data[o + 2], a: 255 };
-        if (colorDist(c, seed) > tolerance) continue;
+        if (colorDistRgb(data[o], data[o + 1], data[o + 2], seed.r, seed.g, seed.b) > tolerance) {
+          continue;
+        }
         closed[nb] = 0;
         stack.push(nb);
+      }
+    }
+  }
+  return closed;
+}
+
+/** Same close as sealedWall, but only inside a window (for small hole clicks). */
+function sealedWallWindow(
+  data: Uint8ClampedArray,
+  width: number,
+  _height: number,
+  seed: Rgba,
+  tolerance: number,
+  seedIndex: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number
+): Uint8Array {
+  const ww = x1 - x0 + 1;
+  const hh = y1 - y0 + 1;
+  const wall = new Uint8Array(ww * hh);
+  const seedLum = luminance(seed.r, seed.g, seed.b);
+  const inkDist = Math.max(22, tolerance * 0.65);
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const o = (y * width + x) * 4;
+      const r = data[o];
+      const g = data[o + 1];
+      const b = data[o + 2];
+      if (seedLum - luminance(r, g, b) >= 42 && colorDistRgb(r, g, b, seed.r, seed.g, seed.b) > inkDist) {
+        wall[(y - y0) * ww + (x - x0)] = 1;
+      }
+    }
+  }
+  let closed = wall;
+  for (let i = 0; i < 2; i++) closed = new Uint8Array(dilateMask(closed, ww, hh));
+  for (let i = 0; i < 2; i++) closed = new Uint8Array(erodeMask(closed, ww, hh));
+
+  const sx = seedIndex % width;
+  const sy = (seedIndex / width) | 0;
+  if (seedIndex >= 0 && sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) {
+    const li = (sy - y0) * ww + (sx - x0);
+    if (closed[li] && !wall[li]) {
+      const stack = [li];
+      closed[li] = 0;
+      while (stack.length) {
+        const i = stack.pop()!;
+        const lx = i % ww;
+        const ly = (i / ww) | 0;
+        const nbs = [
+          lx > 0 ? i - 1 : -1,
+          lx + 1 < ww ? i + 1 : -1,
+          ly > 0 ? i - ww : -1,
+          ly + 1 < hh ? i + ww : -1,
+        ];
+        for (const nb of nbs) {
+          if (nb < 0 || !closed[nb] || wall[nb]) continue;
+          const ix = x0 + (nb % ww);
+          const iy = y0 + ((nb / ww) | 0);
+          const o = (iy * width + ix) * 4;
+          if (colorDistRgb(data[o], data[o + 1], data[o + 2], seed.r, seed.g, seed.b) > tolerance) {
+            continue;
+          }
+          closed[nb] = 0;
+          stack.push(nb);
+        }
       }
     }
   }
@@ -941,21 +1022,194 @@ function retainReachableBackground(
   return out;
 }
 
+export type WandPick = {
+  mask: Uint8Array;
+  seed: Rgba;
+  count: number;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+};
+
+const SMALL_HOLE_PX = 80_000;
+const SMALL_HOLE_EDGE = 640;
+
+function wandPickFromRegion(segmented: SegmentedImage, region: ImageRegion): WandPick | null {
+  const mask = new Uint8Array(segmented.width * segmented.height);
+  let count = 0;
+  forEachRegionPixel(region, segmented.width, (i) => {
+    if (segmented.bgMask[i]) return;
+    mask[i] = 1;
+    count++;
+  });
+  if (count < 1) return null;
+  return {
+    mask,
+    seed: region.color,
+    count,
+    minX: region.minX,
+    minY: region.minY,
+    maxX: region.maxX,
+    maxY: region.maxY,
+  };
+}
+
+function floodWandWindow(
+  segmented: SegmentedImage,
+  seed: Rgba,
+  start: number,
+  tolerance: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number
+): {
+  local: Uint8Array;
+  count: number;
+  hitBorder: boolean;
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+} | null {
+  const { width, height, imageData, bgMask } = segmented;
+  const data = imageData.data;
+  const ww = x1 - x0 + 1;
+  const hh = y1 - y0 + 1;
+  const wall = sealedWallWindow(data, width, height, seed, tolerance, start, x0, y0, x1, y1);
+  const sx = start % width;
+  const sy = (start / width) | 0;
+  const ls = (sy - y0) * ww + (sx - x0);
+  if (ls < 0 || ls >= wall.length || wall[ls]) return null;
+
+  const local = new Uint8Array(ww * hh);
+  const visited = new Uint8Array(ww * hh);
+  const stack = [ls];
+  visited[ls] = 1;
+  let count = 0;
+  let minX = sx;
+  let maxX = sx;
+  let minY = sy;
+  let maxY = sy;
+  let hitBorder = false;
+
+  while (stack.length) {
+    const li = stack.pop()!;
+    const lx = li % ww;
+    const ly = (li / ww) | 0;
+    const x = x0 + lx;
+    const y = y0 + ly;
+    const i = y * width + x;
+    if (bgMask[i] || wall[li]) continue;
+    const o = i * 4;
+    if (colorDistRgb(data[o], data[o + 1], data[o + 2], seed.r, seed.g, seed.b) > tolerance) continue;
+    local[li] = 1;
+    count++;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (
+      (lx === 0 && x0 > 0) ||
+      (lx === ww - 1 && x1 < width - 1) ||
+      (ly === 0 && y0 > 0) ||
+      (ly === hh - 1 && y1 < height - 1)
+    ) {
+      hitBorder = true;
+    }
+    const nbs = [
+      lx > 0 ? li - 1 : -1,
+      lx + 1 < ww ? li + 1 : -1,
+      ly > 0 ? li - ww : -1,
+      ly + 1 < hh ? li + ww : -1,
+    ];
+    for (const n of nbs) {
+      if (n < 0 || visited[n] || wall[n]) continue;
+      const nx = x0 + (n % ww);
+      const ny = y0 + ((n / ww) | 0);
+      const ni = ny * width + nx;
+      if (bgMask[ni]) continue;
+      const no = ni * 4;
+      if (colorDistRgb(data[no], data[no + 1], data[no + 2], seed.r, seed.g, seed.b) > tolerance) {
+        continue;
+      }
+      visited[n] = 1;
+      stack.push(n);
+    }
+  }
+
+  if (count < 1) return null;
+
+  const edgeLum = luminance(seed.r, seed.g, seed.b) * 0.55;
+  const gx0 = Math.max(0, minX - x0 - 1);
+  const gy0 = Math.max(0, minY - y0 - 1);
+  const gx1 = Math.min(ww - 1, maxX - x0 + 1);
+  const gy1 = Math.min(hh - 1, maxY - y0 + 1);
+  for (let pass = 0; pass < 2; pass++) {
+    const add: number[] = [];
+    for (let ly = gy0; ly <= gy1; ly++) {
+      for (let lx = gx0; lx <= gx1; lx++) {
+        const li = ly * ww + lx;
+        if (local[li]) continue;
+        const x = x0 + lx;
+        const y = y0 + ly;
+        const i = y * width + x;
+        if (bgMask[i]) continue;
+        const touches =
+          (lx > 0 && local[li - 1]) ||
+          (lx + 1 < ww && local[li + 1]) ||
+          (ly > 0 && local[li - ww]) ||
+          (ly + 1 < hh && local[li + ww]);
+        if (!touches) continue;
+        const o = i * 4;
+        if (luminance(data[o], data[o + 1], data[o + 2]) >= edgeLum) add.push(li);
+      }
+    }
+    for (const li of add) {
+      local[li] = 1;
+      count++;
+      const x = x0 + (li % ww);
+      const y = y0 + ((li / ww) | 0);
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  return { local, count, hitBorder, minX, minY, maxX, maxY };
+}
+
 /**
  * Contiguous magic-wand flood. Stops at closed darker outlines, so clicking
  * white does not enter holes inside black shapes.
+ *
+ * Small closed parts (letter holes) use the existing region mask. Larger
+ * floods run in an expanding window so a 5k image is not scanned on every click.
  */
 export function pickWandRegion(
   segmented: SegmentedImage,
   px: number,
   py: number,
   tolerance: number
-): { mask: Uint8Array; seed: Rgba; count: number } | null {
+): WandPick | null {
   const { width, height, imageData, bgMask } = segmented;
   const sx = Math.max(0, Math.min(width - 1, Math.floor(px)));
   const sy = Math.max(0, Math.min(height - 1, Math.floor(py)));
   const start = sy * width + sx;
   if (bgMask[start]) return null;
+
+  const hit = hitTestRegion(segmented, sx, sy);
+  if (
+    hit &&
+    hit.pixelCount <= SMALL_HOLE_PX &&
+    hit.maxX - hit.minX + 1 <= SMALL_HOLE_EDGE &&
+    hit.maxY - hit.minY + 1 <= SMALL_HOLE_EDGE
+  ) {
+    const fromHit = wandPickFromRegion(segmented, hit);
+    if (fromHit) return fromHit;
+  }
 
   const data = imageData.data;
   const seedI = start * 4;
@@ -965,63 +1219,38 @@ export function pickWandRegion(
     b: data[seedI + 2],
     a: 255,
   };
-  const wall = sealedWall(data, width, height, seed, tolerance, start);
-  if (wall[start]) return null;
 
-  const mask = new Uint8Array(width * height);
-  const visited = new Uint8Array(width * height);
-  const stack = [start];
-  visited[start] = 1;
-  let count = 0;
-
-  while (stack.length) {
-    const i = stack.pop()!;
-    if (bgMask[i] || wall[i]) continue;
-    const o = i * 4;
-    const c: Rgba = { r: data[o], g: data[o + 1], b: data[o + 2], a: 255 };
-    if (colorDist(c, seed) > tolerance) continue;
-    mask[i] = 1;
-    count++;
-    const x = i % width;
-    const y = (i / width) | 0;
-    const neighbors = [i - 1, i + 1, i - width, i + width];
-    for (const n of neighbors) {
-      if (n < 0 || n >= width * height) continue;
-      const nx = n % width;
-      const ny = (n / width) | 0;
-      if (Math.abs(nx - x) + Math.abs(ny - y) !== 1) continue;
-      if (visited[n] || bgMask[n] || wall[n]) continue;
-      const no = n * 4;
-      const nc: Rgba = { r: data[no], g: data[no + 1], b: data[no + 2], a: 255 };
-      if (colorDist(nc, seed) > tolerance) continue;
-      visited[n] = 1;
-      stack.push(n);
+  let rad = 80;
+  const maxRad = Math.max(width, height);
+  for (;;) {
+    const x0 = Math.max(0, sx - rad);
+    const y0 = Math.max(0, sy - rad);
+    const x1 = Math.min(width - 1, sx + rad);
+    const y1 = Math.min(height - 1, sy + rad);
+    const full = x0 === 0 && y0 === 0 && x1 === width - 1 && y1 === height - 1;
+    const got = floodWandWindow(segmented, seed, start, tolerance, x0, y0, x1, y1);
+    if (!got) return null;
+    if (!got.hitBorder || full) {
+      const mask = new Uint8Array(width * height);
+      const ww = x1 - x0 + 1;
+      for (let y = got.minY; y <= got.maxY; y++) {
+        for (let x = got.minX; x <= got.maxX; x++) {
+          if (got.local[(y - y0) * ww + (x - x0)]) mask[y * width + x] = 1;
+        }
+      }
+      return {
+        mask,
+        seed,
+        count: got.count,
+        minX: got.minX,
+        minY: got.minY,
+        maxX: got.maxX,
+        maxY: got.maxY,
+      };
     }
+    if (full) return null;
+    rad = Math.min(maxRad, rad * 2);
   }
-
-  // Reach the visual edge: blended pixels lighter than halfway to the ink join (≤2 px).
-  const edgeLum = luminance(seed.r, seed.g, seed.b) * 0.55;
-  for (let pass = 0; pass < 2; pass++) {
-    const add: number[] = [];
-    for (let i = 0; i < mask.length; i++) {
-      if (mask[i] || bgMask[i]) continue;
-      const x = i % width;
-      const y = (i / width) | 0;
-      const touches =
-        (x > 0 && mask[i - 1]) ||
-        (x + 1 < width && mask[i + 1]) ||
-        (y > 0 && mask[i - width]) ||
-        (y + 1 < height && mask[i + width]);
-      if (!touches) continue;
-      const o = i * 4;
-      if (luminance(data[o], data[o + 1], data[o + 2]) >= edgeLum) add.push(i);
-    }
-    for (const i of add) mask[i] = 1;
-    count += add.length;
-  }
-
-  if (count < 1) return null;
-  return { mask, seed, count };
 }
 
 /**
@@ -1067,6 +1296,197 @@ export function addWandBgPart(
     kind: 'click',
   };
   return { segmented: withRebuiltRegions(segmented, { bgMask }), part };
+}
+
+function applyLocalSmoothGrow(
+  mask: Uint8Array,
+  live: SegmentedImage,
+  pick: WandPick,
+  seedX: number,
+  seedY: number,
+  tolerance: number,
+  smooth: number,
+  grow: number
+): { minX: number; minY: number; maxX: number; maxY: number } {
+  if (smooth <= 0 && grow <= 0) {
+    return { minX: pick.minX, minY: pick.minY, maxX: pick.maxX, maxY: pick.maxY };
+  }
+  const pad = Math.max(2, Math.round(smooth) + Math.round(grow) + 2);
+  const x0 = Math.max(0, pick.minX - pad);
+  const y0 = Math.max(0, pick.minY - pad);
+  const x1 = Math.min(live.width - 1, pick.maxX + pad);
+  const y1 = Math.min(live.height - 1, pick.maxY + pad);
+  const ww = x1 - x0 + 1;
+  const hh = y1 - y0 + 1;
+  const local = new Uint8Array(ww * hh);
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      if (mask[y * live.width + x]) local[(y - y0) * ww + (x - x0)] = 1;
+    }
+  }
+  const sx = Math.max(0, Math.min(live.width - 1, Math.floor(seedX)));
+  const sy = Math.max(0, Math.min(live.height - 1, Math.floor(seedY)));
+  const seedIndex = sy * live.width + sx;
+  const wall = sealedWallWindow(
+    live.imageData.data,
+    live.width,
+    live.height,
+    pick.seed,
+    tolerance,
+    seedIndex,
+    x0,
+    y0,
+    x1,
+    y1
+  );
+  const grown = smoothGrowMask(local, ww, hh, smooth, grow, wall);
+  let minX = pick.minX;
+  let minY = pick.minY;
+  let maxX = pick.maxX;
+  let maxY = pick.maxY;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      if (!grown[(y - y0) * ww + (x - x0)]) continue;
+      mask[y * live.width + x] = 1;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function punchRegionsByNewMask(
+  seg: SegmentedImage,
+  newMask: Uint8Array,
+  box: { minX: number; minY: number; maxX: number; maxY: number }
+): { regions: ImageRegion[]; removedIds: string[]; changedIds: string[] } {
+  const pts: Array<{ x: number; y: number }> = [];
+  for (let y = box.minY; y <= box.maxY; y++) {
+    for (let x = box.minX; x <= box.maxX; x++) {
+      const i = y * seg.width + x;
+      if (newMask[i] && !seg.bgMask[i]) pts.push({ x, y });
+    }
+  }
+  const removedIds: string[] = [];
+  const changedIds: string[] = [];
+  const regions: ImageRegion[] = [];
+  for (const r of seg.regions) {
+    if (r.maxX < box.minX || r.minX > box.maxX || r.maxY < box.minY || r.minY > box.maxY) {
+      regions.push(r);
+      continue;
+    }
+    let lost = 0;
+    for (const p of pts) {
+      if (regionHasPixel(r, p.x, p.y)) lost++;
+    }
+    if (lost < 1) {
+      regions.push(r);
+      continue;
+    }
+    const keep = r.pixelCount - lost;
+    if (keep < 1) {
+      removedIds.push(r.id);
+      continue;
+    }
+    const mw = r.maxX - r.minX + 1;
+    let minX = r.maxX;
+    let minY = r.maxY;
+    let maxX = r.minX;
+    let maxY = r.minY;
+    for (let y = r.minY; y <= r.maxY; y++) {
+      for (let x = r.minX; x <= r.maxX; x++) {
+        if (!r.mask[(y - r.minY) * mw + (x - r.minX)]) continue;
+        if (newMask[y * seg.width + x]) continue;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (maxX < minX) {
+      removedIds.push(r.id);
+      continue;
+    }
+    const nmw = maxX - minX + 1;
+    const mask = new Uint8Array(nmw * (maxY - minY + 1));
+    let count = 0;
+    for (let y = r.minY; y <= r.maxY; y++) {
+      for (let x = r.minX; x <= r.maxX; x++) {
+        if (!r.mask[(y - r.minY) * mw + (x - r.minX)]) continue;
+        if (newMask[y * seg.width + x]) continue;
+        mask[(y - minY) * nmw + (x - minX)] = 1;
+        count++;
+      }
+    }
+    if (count < 1) {
+      removedIds.push(r.id);
+      continue;
+    }
+    changedIds.push(r.id);
+    regions.push({ ...r, mask, pixelCount: count, minX, minY, maxX, maxY });
+  }
+  return { regions, removedIds, changedIds };
+}
+
+/**
+ * Add one wand click as BG without re-flooding every previous pick or
+ * re-segmenting the whole bitmap. Used for hole clicks on large images.
+ */
+export function appendWandClickPick(
+  live: SegmentedImage,
+  parts: WandBgPart[],
+  seedX: number,
+  seedY: number,
+  tolerance: number,
+  smooth: number,
+  grow: number,
+  id: string,
+  name: string
+): {
+  segmented: SegmentedImage;
+  parts: WandBgPart[];
+  added: WandBgPart;
+  removedRegionIds: string[];
+  changedRegionIds: string[];
+} | null {
+  const picked = pickWandRegion(live, seedX, seedY, tolerance);
+  if (!picked || picked.count < 1) return null;
+
+  const mask = new Uint8Array(picked.mask);
+  const box = applyLocalSmoothGrow(mask, live, picked, seedX, seedY, tolerance, smooth, grow);
+
+  const bgMask = new Uint8Array(live.bgMask);
+  let pixelCount = 0;
+  for (let y = box.minY; y <= box.maxY; y++) {
+    for (let x = box.minX; x <= box.maxX; x++) {
+      const i = y * live.width + x;
+      if (!mask[i]) continue;
+      bgMask[i] = 1;
+      pixelCount++;
+    }
+  }
+  if (pixelCount < 1) return null;
+
+  const punched = punchRegionsByNewMask(live, mask, box);
+  const added: WandBgPart = {
+    id,
+    name,
+    hex: rgbaToHex(picked.seed),
+    pixelCount,
+    mask,
+    seedX,
+    seedY,
+    kind: 'click',
+  };
+  return {
+    segmented: { ...live, bgMask, regions: punched.regions },
+    parts: [...parts, added],
+    added,
+    removedRegionIds: punched.removedIds,
+    changedRegionIds: punched.changedIds,
+  };
 }
 
 /** Mark an existing FG region mask as a wand BG list entry. */

@@ -40,6 +40,8 @@ export interface MeasureOverlayLine {
   color?: number;
   /** Drawn floating above the midpoint of the line. */
   label?: string;
+  /** Endpoint dots. Default true. */
+  showEnds?: boolean;
 }
 
 export interface MeshViewer3DProps {
@@ -741,8 +743,10 @@ export function MeshViewer3D({
 
     for (const line of measureOverlays) {
       const color = line.color ?? 0x38bdf8;
-      addMark(line.a, color);
-      addMark(line.b, color);
+      if (line.showEnds !== false) {
+        addMark(line.a, color);
+        addMark(line.b, color);
+      }
       addLine(line.a, line.b, color);
       if (line.label) addLabel(line.a, line.b, color, line.label);
     }
