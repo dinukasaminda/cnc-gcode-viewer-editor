@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
 import {
   MeshViewer3D,
   type MeasureMode,
@@ -11,8 +11,10 @@ import {
   buildExtrudedParts,
   disposeExtruded,
   foregroundPixelBox,
+  MM_PER_CM,
   modelSizeMm,
   partsBoundingMm,
+  sourceImageSizeMm,
   syncExtrudedParts,
   updateRegion,
   type ExtrudedPart,
@@ -39,6 +41,29 @@ import {
 import { DEFAULT_OUTLINE_OPTIONS, type OutlineOptions } from '../core/maskContour';
 import { download3mf, exportGeometriesTo3mf } from '../core/threemf';
 import '../App.css';
+
+const IMAGE_FILE_RE = /\.(png|jpe?g|webp|gif)$/i;
+
+function isImageTo3dFile(file: File): boolean {
+  const t = file.type.toLowerCase();
+  if (t.startsWith('image/')) {
+    return /png|jpe?g|jpg|webp|gif/.test(t);
+  }
+  return IMAGE_FILE_RE.test(file.name);
+}
+
+function firstImageFile(files: FileList | null | undefined): File | null {
+  if (!files) return null;
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    if (f && isImageTo3dFile(f)) return f;
+  }
+  return null;
+}
+
+function transferHasFiles(dt: DataTransfer): boolean {
+  return [...dt.types].includes('Files');
+}
 
 const OUTLINE_SLIDERS: {
   key: keyof OutlineOptions;
@@ -84,7 +109,14 @@ function mmFilenameToken(n: number, decimals: number): string {
   return `${n.toFixed(decimals)}mm`;
 }
 
-/** `_80mm_80.00mm_1.00mm` — plate width, plate height, print (Z) height. */
+/** `_80mm_80.00mm_1.00mm` — width, height (image Y), thickness (Z). */
+const INPUT_PX_PER_CM = [300, 200, 72] as const;
+type InputResolution = (typeof INPUT_PX_PER_CM)[number] | 'none';
+
+function pxPerInchFromPxPerCm(pxPerCm: number): number {
+  return (pxPerCm * 25.4) / 10;
+}
+
 function modelSizeFilenameTag(widthMm: number, heightMm: number, printHeightMm: number): string {
   return `_${mmFilenameToken(widthMm, 0)}_${mmFilenameToken(heightMm, 2)}_${mmFilenameToken(printHeightMm, 2)}`;
 }
@@ -114,6 +146,7 @@ export default function ImageTo3d() {
   const [segmented, setSegmented] = useState<SegmentedImage | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [widthMm, setWidthMm] = useState(80);
+  const [resolution, setResolution] = useState<InputResolution>(300);
   const [baseEnabled, setBaseEnabled] = useState(false);
   const [baseHeightMm, setBaseHeightMm] = useState(1);
   const [smoothEdges, setSmoothEdges] = useState(true);
@@ -140,11 +173,14 @@ export default function ImageTo3d() {
   const [resetKey, setResetKey] = useState(0);
   const [wireframe, setWireframe] = useState(false);
   const [bedColor, setBedColor] = useState<'yellow' | 'white' | 'black'>('yellow');
+  const [showA4, setShowA4] = useState(false);
   const [leftWidth, setLeftWidth] = useState(360);
   const resizeDrag = useRef<{ x: number; w: number } | null>(null);
   const [measureMode, setMeasureMode] = useState<MeasureMode>('off');
   const [measurePoints, setMeasurePoints] = useState<MeasurePoint[]>([]);
   const [extruded, setExtruded] = useState<ExtrudedPart[]>([]);
+  const [dropActive, setDropActive] = useState(false);
+  const dropDepth = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewRef = useRef<HTMLCanvasElement>(null);
   const previewWrapRef = useRef<HTMLDivElement>(null);
@@ -167,9 +203,14 @@ export default function ImageTo3d() {
     wandBgPartsRef.current = wandBgParts;
   }, [wandBgParts]);
 
+  const pxPerCm = resolution === 'none' ? null : resolution;
   const size = useMemo(
-    () => (segmented ? modelSizeMm(segmented, widthMm) : null),
-    [segmented, widthMm]
+    () => (segmented ? modelSizeMm(segmented, widthMm, pxPerCm) : null),
+    [segmented, widthMm, pxPerCm]
+  );
+  const imageSize = useMemo(
+    () => (segmented && pxPerCm ? sourceImageSizeMm(segmented, pxPerCm) : null),
+    [segmented, pxPerCm]
   );
   const hasTransparency = useMemo(
     () => (segmented ? imageHasTransparency(segmented) : false),
@@ -183,16 +224,26 @@ export default function ImageTo3d() {
     const b = measurePoints[1];
     return Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
   }, [measurePoints]);
+  const measuredAxes = useMemo(() => {
+    if (measurePoints.length < 2) return null;
+    const a = measurePoints[0];
+    const b = measurePoints[1];
+    const dx = Math.abs(b.x - a.x);
+    const dy = Math.abs(b.y - a.y);
+    if (dx < 0.04 || dy < 0.04) return null;
+    return { dx, dy };
+  }, [measurePoints]);
 
   const settings: ExtrudeSettings = useMemo(
     () => ({
       widthMm,
+      pxPerCm,
       baseHeightMm,
       baseEnabled,
       smoothEdges,
       outline: outlineOpts,
     }),
-    [widthMm, baseHeightMm, baseEnabled, smoothEdges, outlineOpts]
+    [widthMm, pxPerCm, baseHeightMm, baseEnabled, smoothEdges, outlineOpts]
   );
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -434,7 +485,7 @@ export default function ImageTo3d() {
           const a = next[0];
           const b = next[1];
           const d = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
-          setStatus(`Measured ${formatNum(d)} mm (model units). Click again to remeasure.`);
+          setStatus(`Measured ${formatNum(d)} mm (model units). Drag a cross to adjust.`);
         }
         return next;
       });
@@ -442,9 +493,21 @@ export default function ImageTo3d() {
     [busy, measureMode]
   );
 
-  const onFiles = async (files: FileList | null) => {
-    const file = files?.[0];
-    if (!file) return;
+  const onMeasurePointMove = useCallback((index: number, point: MeasurePoint) => {
+    setMeasurePoints((prev) => {
+      if (index < 0 || index >= prev.length) return prev;
+      const next = prev.map((p, i) => (i === index ? point : p));
+      if (next.length === 2) {
+        const a = next[0];
+        const b = next[1];
+        const d = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+        setStatus(`Measured ${formatNum(d)} mm (model units). Drag a cross to adjust.`);
+      }
+      return next;
+    });
+  }, []);
+
+  const openImageFile = async (file: File) => {
     setBusy(true);
     try {
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
@@ -458,6 +521,53 @@ export default function ImageTo3d() {
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
+  };
+
+  const onFiles = async (files: FileList | null) => {
+    const file = firstImageFile(files);
+    if (!file) {
+      if (files && files.length > 0) setStatus('Need a PNG, JPEG, WebP, or GIF.');
+      return;
+    }
+    await openImageFile(file);
+  };
+
+  const canDropOpen = !segmented && !busy;
+
+  const onDragEnter = (e: DragEvent) => {
+    if (!transferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    if (!canDropOpen) return;
+    dropDepth.current += 1;
+    setDropActive(true);
+  };
+
+  const onDragOver = (e: DragEvent) => {
+    if (!transferHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = canDropOpen ? 'copy' : 'none';
+  };
+
+  const onDragLeave = () => {
+    if (!canDropOpen) return;
+    dropDepth.current -= 1;
+    if (dropDepth.current <= 0) {
+      dropDepth.current = 0;
+      setDropActive(false);
+    }
+  };
+
+  const onDrop = (e: DragEvent) => {
+    e.preventDefault();
+    dropDepth.current = 0;
+    setDropActive(false);
+    if (!canDropOpen) return;
+    const file = firstImageFile(e.dataTransfer.files);
+    if (!file) {
+      setStatus('Drop a PNG, JPEG, WebP, or GIF.');
+      return;
+    }
+    void openImageFile(file);
   };
 
   const onPreviewClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -506,7 +616,8 @@ export default function ImageTo3d() {
       window.setTimeout(() => {
         if (job !== meshJobRef.current) return;
         setExtruded((prev) => {
-          if (prev.length === 0 || prevBodyW !== nextBodyW) {
+          const resLocked = extrude.pxPerCm != null && extrude.pxPerCm > 0;
+          if (prev.length === 0 || (!resLocked && prevBodyW !== nextBodyW)) {
             if (prev.length > 0) disposeExtruded(prev);
             return buildExtrudedParts(nextSeg, extrude);
           }
@@ -705,7 +816,7 @@ export default function ImageTo3d() {
     segmentedRef.current = next;
     setSegmented(next);
     setHeightPending(false);
-    setStatus(`Height ${formatNum(h)} mm → all ${next.regions.length} parts`);
+    setStatus(`Thickness ${formatNum(h)} mm → all ${next.regions.length} parts`);
     queueFullMesh(next);
   };
 
@@ -748,7 +859,7 @@ export default function ImageTo3d() {
     if (selectedIds.length === 0) return;
     patchSelectedHeight(partHeightMm, 0);
     setHeightPending(false);
-    setStatus(`Height ${formatNum(partHeightMm)} mm → ${selectedIds.length} selected part(s)`);
+    setStatus(`Thickness ${formatNum(partHeightMm)} mm → ${selectedIds.length} selected part(s)`);
   };
 
   const patchSelectedPrintColor = (printHex: string) => {
@@ -815,7 +926,7 @@ export default function ImageTo3d() {
         a: { x: minX, y: yFront, z: zLine },
         b: { x: maxX, y: yFront, z: zLine },
         color: 0xf5c518,
-        label: `model width ${formatNum(widthMm)} mm`,
+        label: `width ${formatNum(w)} mm`,
       },
       {
         a: { x: minX, y: minY, z: zLine },
@@ -833,7 +944,7 @@ export default function ImageTo3d() {
         a: { x: xLeft, y: minY, z: zLine },
         b: { x: xLeft, y: maxY, z: zLine },
         color: 0x7dd3fc,
-        label: `depth ${formatNum(d)} mm`,
+        label: `height ${formatNum(d)} mm`,
       },
       {
         a: { x: minX, y: minY, z: zLine },
@@ -856,7 +967,7 @@ export default function ImageTo3d() {
           a: { x: xh, y: yh, z: minZ },
           b: { x: xh, y: yh, z: maxZ },
           color: 0xa3e635,
-          label: `height ${formatNum(printH)} mm`,
+          label: `thickness ${formatNum(printH)} mm`,
         },
         {
           a: { x: xh, y: maxY, z: maxZ },
@@ -867,18 +978,24 @@ export default function ImageTo3d() {
       );
     }
     return lines;
-  }, [bodySize, widthMm]);
+  }, [bodySize]);
 
   const totalTris = extruded.reduce((s, p) => s + p.triangleCount, 0);
 
   return (
-    <div className="app tool-image3d">
+    <div
+      className={dropActive ? 'app tool-image3d drop-target' : 'app tool-image3d'}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark">2→3</span>
           <div>
             <h1>Image → 3D</h1>
-            <p>Color regions → heights → multi-part 3MF</p>
+            <p>Color regions → thickness → multi-part 3MF</p>
           </div>
         </div>
         <div className="top-actions">
@@ -1063,17 +1180,77 @@ export default function ImageTo3d() {
 
           <section>
             <h2>Dimensions</h2>
-            <label title="Left-to-right size of the 3D solid — the yellow ruler.">
+            <p className="muted tiny" style={{ marginBottom: '0.35rem' }}>
+              Input resolution
+            </p>
+            <div className="row-actions" role="radiogroup" aria-label="Input resolution">
+              {INPUT_PX_PER_CM.map((ppc) => (
+                <button
+                  key={ppc}
+                  type="button"
+                  role="radio"
+                  aria-checked={resolution === ppc}
+                  className={resolution === ppc ? 'primary' : ''}
+                  title={`${ppc} pixels per cm · ${formatNum(pxPerInchFromPxPerCm(ppc), 0)} px/inch`}
+                  onClick={() => setResolution(ppc)}
+                >
+                  {ppc}
+                </button>
+              ))}
+              <button
+                type="button"
+                role="radio"
+                aria-checked={resolution === 'none'}
+                className={resolution === 'none' ? 'primary' : ''}
+                title="Type model width in millimetres"
+                onClick={() => {
+                  if (resolution !== 'none' && segmented) {
+                    const computed = modelSizeMm(segmented, widthMm, resolution).widthMm;
+                    if (computed > 0) setWidthMm(computed);
+                  }
+                  setResolution('none');
+                }}
+              >
+                None
+              </button>
+            </div>
+            <p className="muted tiny">
+              {resolution === 'none'
+                ? 'Resolution off — type Model width. Print thickness is always mm.'
+                : `${resolution} px/cm · ${formatNum(pxPerInchFromPxPerCm(resolution), 0)} px/inch · 1 px = ${formatNum(MM_PER_CM / resolution, 3)} mm. Set None to type Model width. Thickness stays mm.`}
+            </p>
+            {imageSize && segmented && resolution !== 'none' && (
+              <p className="muted tiny mono">
+                Image {formatNum(imageSize.widthCm)} cm wide
+                {' · '}
+                {formatNum(imageSize.widthMm)} × {formatNum(imageSize.heightMm)} mm
+                {' · '}
+                {segmented.sourceWidth}×{segmented.sourceHeight} px @ {resolution} px/cm
+              </p>
+            )}
+            <label
+              title={
+                resolution === 'none'
+                  ? 'Left-to-right size of the 3D solid — the yellow ruler.'
+                  : 'Locked while a resolution is set. Choose None to type a width.'
+              }
+            >
               Model width (mm)
-              <NumberInput step={1} min={5} max={500} value={widthMm} onChange={setWidthMm} />
+              <NumberInput
+                step={1}
+                min={5}
+                max={5000}
+                value={resolution === 'none' ? widthMm : (size?.widthMm ?? widthMm)}
+                onChange={setWidthMm}
+                disabled={resolution !== 'none'}
+              />
             </label>
             <p className="muted tiny">
-              This value is the yellow ruler: left → right of the solid. Blue is depth (aspect of
-              the solid); green is print height.
+              Yellow is width, blue is height (image), green is thickness (always mm).
             </p>
             {bodySize && (
               <p className="muted tiny mono">
-                3D body {formatNum(bodySize.widthMm)} × {formatNum(bodySize.depthMm)} ×{' '}
+                3D {formatNum(bodySize.widthMm)} × {formatNum(bodySize.depthMm)} mm · thk{' '}
                 {formatNum(bodySize.heightMm)} mm
               </p>
             )}
@@ -1101,7 +1278,7 @@ export default function ImageTo3d() {
             </label>
             {baseEnabled && (
               <label>
-                Base height (mm)
+                Base thickness (mm)
                 <NumberInput
                   step={0.1}
                   min={0.2}
@@ -1131,7 +1308,13 @@ export default function ImageTo3d() {
             <p className="muted tiny mono" style={{ marginTop: '0.35rem' }}>
               Distance:{' '}
               {measuredMm > 0 ? `${formatNum(measuredMm)} mm` : measureMode === 'line' ? `${measurePoints.length}/2` : '—'}
+              {measuredAxes
+                ? ` · ΔX ${formatNum(measuredAxes.dx)} · ΔY ${formatNum(measuredAxes.dy)} mm`
+                : ''}
             </p>
+            {measuredAxes && (
+              <p className="muted tiny">ΔX / ΔY triangle shows in exact TOP view.</p>
+            )}
           </section>
         </aside>
 
@@ -1236,9 +1419,9 @@ export default function ImageTo3d() {
               ) : (
                 <div className="stage-photo-wrap">
                   <p className="muted">
-                    Open an image, then use Wand on this canvas
+                    Drop an image here, or Open image
                     <br />
-                    to mark background and foreground.
+                    PNG, JPEG, WebP, GIF — then wand-pick BG on this canvas.
                   </p>
                 </div>
               )}
@@ -1247,9 +1430,9 @@ export default function ImageTo3d() {
               {wandBgParts.length === 0 ? (
                 <div className="stage-photo-wrap">
                   <p className="muted">
-                    Open an image and wand-pick background
-                    <br />
-                    on the Canvas tab to build the 3D preview.
+                    {segmented
+                      ? 'Wand-pick background on the Canvas tab to build the 3D preview.'
+                      : 'Drop an image here, or Open image — then wand-pick BG on the Canvas tab.'}
                   </p>
                 </div>
               ) : (
@@ -1263,7 +1446,9 @@ export default function ImageTo3d() {
                   measureOverlays={sizeOverlays}
                   upAxis="z"
                   bedColor={bedColor}
+                  reference={showA4 ? 'a4' : 'none'}
                   onSurfaceHit={onSurfaceHit}
+                  onMeasurePointMove={onMeasurePointMove}
                   onPartClick={(ev) => {
                     if (measureMode !== 'off' || activeTool !== 'part') return;
                     togglePartSelection(
@@ -1286,8 +1471,12 @@ export default function ImageTo3d() {
             )}
             {measureMode !== 'off' && (
               <div className="measure-banner">
-                Measure distance — click two points on the model ({measurePoints.length}/2)
-                {measuredMm > 0 ? ` · ${formatNum(measuredMm)} mm` : ''} · RMB orbit · scroll zoom
+                Measure distance — click two points, then drag the crosses ({measurePoints.length}/2)
+                {measuredMm > 0 ? ` · ${formatNum(measuredMm)} mm` : ''}
+                {measuredAxes
+                  ? ` · ΔX ${formatNum(measuredAxes.dx)} · ΔY ${formatNum(measuredAxes.dy)}`
+                  : ''}{' '}
+                · TOP view shows XY triangle · RMB orbit · scroll zoom
               </div>
             )}
             {busy && <div className="viewport-busy">Working…</div>}
@@ -1406,9 +1595,9 @@ export default function ImageTo3d() {
           </section>
 
           <section>
-            <h2>Part height</h2>
+            <h2>Part thickness</h2>
             <label>
-              Height (mm)
+              Thickness (mm)
               <NumberInput
                 step={0.1}
                 min={0.1}
@@ -1432,11 +1621,11 @@ export default function ImageTo3d() {
                 onClick={applyHeightToAll}
                 title={
                   heightPending && selectedIds.length === 0
-                    ? 'Height changed — click to apply to all parts'
+                    ? 'Thickness changed — click to apply to all parts'
                     : undefined
                 }
               >
-                Change height · all parts
+                Change thickness · all parts
               </button>
               <button
                 type="button"
@@ -1445,7 +1634,7 @@ export default function ImageTo3d() {
                 onClick={applyHeightToSelected}
                 title={
                   heightPending && selectedIds.length > 0
-                    ? 'Height changed — click to apply to selected parts'
+                    ? 'Thickness changed — click to apply to selected parts'
                     : undefined
                 }
               >
@@ -1455,8 +1644,8 @@ export default function ImageTo3d() {
             {heightPending && (selectedIds.length > 0 || (segmented?.regions.length ?? 0) > 0) ? (
               <p className="muted tiny needs-apply-hint">
                 {selectedIds.length > 0
-                  ? 'Height edited — click Selected parts to update the 3D mesh.'
-                  : 'Height edited — click Change height · all parts to update the 3D mesh.'}
+                  ? 'Thickness edited — click Selected parts to update the 3D mesh.'
+                  : 'Thickness edited — click Change thickness · all parts to update the 3D mesh.'}
               </p>
             ) : null}
           </section>
@@ -1557,7 +1746,7 @@ export default function ImageTo3d() {
                       <span className="part-info">
                         <span className="part-name">{r.name}</span>
                         <span className="muted tiny">
-                          h {formatNum(r.heightMm)} mm · 3D {r.printHex || '#000'}
+                          thk {formatNum(r.heightMm)} mm · 3D {r.printHex || '#000'}
                           {!r.enabled ? ' · off' : ''}
                         </span>
                       </span>
@@ -1581,7 +1770,7 @@ export default function ImageTo3d() {
                   {selectedRegion ? ` · ${selectedRegion.name}` : ''}
                 </p>
                 <label>
-                  Height (mm)
+                  Thickness (mm)
                   <NumberInput
                     step={0.1}
                     min={0}
@@ -1677,6 +1866,18 @@ export default function ImageTo3d() {
             <label className="check">
               <input
                 type="checkbox"
+                checked={showA4}
+                onChange={(e) => {
+                  setShowA4(e.target.checked);
+                  setResetKey((k) => k + 1);
+                }}
+              />
+              A4 paper (210 × 297 mm)
+            </label>
+            <p className="muted tiny">Viewer-only size reference — not exported.</p>
+            <label className="check">
+              <input
+                type="checkbox"
                 checked={wireframe}
                 onChange={(e) => setWireframe(e.target.checked)}
               />
@@ -1711,12 +1912,13 @@ export default function ImageTo3d() {
         <span>{status}</span>
         <span className="muted">
           {segmented
-            ? `${segmented.regions.length} parts · ${formatNum(widthMm)} mm wide · ${extruded.length} solids${
+            ? `${segmented.regions.length} parts · ${formatNum(size?.widthMm ?? widthMm)} mm wide · ${extruded.length} solids${
                 measuredMm > 0 ? ` · measured ${formatNum(measuredMm)} mm` : ''
               }`
             : 'No image'}
         </span>
       </footer>
+      {dropActive && <div className="drop-overlay">Drop image to open</div>}
     </div>
   );
 }

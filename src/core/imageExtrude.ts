@@ -11,9 +11,17 @@ export interface PixelBox {
   heightPx: number;
 }
 
+export const MM_PER_CM = 10;
+export const MM_PER_INCH = 25.4;
+
 export interface ExtrudeSettings {
   /** Physical left-to-right size of the 3D solid (yellow ruler) in mm */
   widthMm: number;
+  /**
+   * Source-image pixels per centimetre. When set, XY size comes from the bitmap;
+   * `widthMm` is ignored. Print thickness (Z) is always millimetres.
+   */
+  pxPerCm?: number | null;
   /** Optional base plate height (0 = none). Uses lightest bg color. */
   baseHeightMm: number;
   /** Z of the bottom of features (base top). */
@@ -238,6 +246,30 @@ export function pixelMmForModelWidth(seg: SegmentedImage, widthMm: number): numb
   return widthMm / px;
 }
 
+/** Millimetres per working pixel from source px/cm (accounts for downsample). */
+export function pixelMmFromPxPerCm(seg: SegmentedImage, pxPerCm: number): number {
+  const ppc = Math.max(1, pxPerCm);
+  const scale = seg.downsample > 1e-9 ? seg.downsample : 1;
+  return MM_PER_CM / (ppc * scale);
+}
+
+export function pixelMmForSettings(seg: SegmentedImage, settings: ExtrudeSettings): number {
+  const ppc = settings.pxPerCm;
+  if (ppc && ppc > 0) return pixelMmFromPxPerCm(seg, ppc);
+  return pixelMmForModelWidth(seg, settings.widthMm);
+}
+
+/** Full source bitmap size at the given px/cm — not the 3D body. */
+export function sourceImageSizeMm(
+  seg: SegmentedImage,
+  pxPerCm: number
+): { widthMm: number; heightMm: number; widthCm: number; heightCm: number } {
+  const mmPerPx = MM_PER_CM / Math.max(1, pxPerCm);
+  const widthMm = seg.sourceWidth * mmPerPx;
+  const heightMm = seg.sourceHeight * mmPerPx;
+  return { widthMm, heightMm, widthCm: widthMm / MM_PER_CM, heightCm: heightMm / MM_PER_CM };
+}
+
 function makeBasePart(
   width: number,
   height: number,
@@ -335,7 +367,7 @@ export function buildExtrudedParts(
 ): ExtrudedPart[] {
   const { width, height, regions } = segmented;
   const body = foregroundPixelBox(segmented);
-  const pixelMm = pixelMmForModelWidth(segmented, settings.widthMm);
+  const pixelMm = pixelMmForSettings(segmented, settings);
   const parts: ExtrudedPart[] = [];
 
   if (settings.baseEnabled && settings.baseHeightMm > 0) {
@@ -347,7 +379,9 @@ export function buildExtrudedParts(
     if (part) parts.push(part);
   }
 
-  fitPartsToModelWidth(parts, settings.widthMm);
+  if (!settings.pxPerCm) {
+    fitPartsToModelWidth(parts, settings.widthMm);
+  }
   return parts;
 }
 
@@ -382,8 +416,9 @@ export function syncExtrudedParts(
     next.push(p);
   }
 
+  const pixelMm = pixelMmForSettings(segmented, settings);
+
   if (keepBase && !hasBase) {
-    const pixelMm = pixelMmForModelWidth(segmented, settings.widthMm);
     next.push(
       makeBasePart(
         segmented.width,
@@ -396,7 +431,6 @@ export function syncExtrudedParts(
   }
 
   const have = new Set(next.map((p) => p.id));
-  const pixelMm = pixelMmForModelWidth(segmented, settings.widthMm);
   for (const r of segmented.regions) {
     if (!alive.has(r.id) || have.has(r.id)) continue;
     const part = extrudeOneRegion(r, segmented.width, segmented.height, settings, pixelMm);
@@ -407,12 +441,14 @@ export function syncExtrudedParts(
 
 export function modelSizeMm(
   segmented: SegmentedImage,
-  widthMm: number
+  widthMm: number,
+  pxPerCm?: number | null
 ): { widthMm: number; heightMm: number; depthMm: number; pixelMm: number } {
-  const pixelMm = pixelMmForModelWidth(segmented, widthMm);
+  const pixelMm = pixelMmForSettings(segmented, { widthMm, pxPerCm, baseHeightMm: 0, baseEnabled: false });
   const body = foregroundPixelBox(segmented);
+  const bodyW = (body?.widthPx ?? segmented.width) * pixelMm;
   return {
-    widthMm,
+    widthMm: pxPerCm && pxPerCm > 0 ? bodyW : widthMm,
     heightMm: (body?.heightPx ?? segmented.height) * pixelMm,
     depthMm: pixelMm,
     pixelMm,

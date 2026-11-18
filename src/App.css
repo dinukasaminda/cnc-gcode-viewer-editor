@@ -116,6 +116,7 @@
 }
 
 .app {
+  position: relative;
   height: 100%;
   display: grid;
   grid-template-rows: auto 1fr auto;
@@ -308,6 +309,12 @@ label select {
   color: var(--text);
   width: 100%;
   min-width: 0;
+}
+
+label input:disabled,
+label select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 .row {
@@ -1255,6 +1262,26 @@ button.needs-apply:not(:disabled) {
   background: rgba(11, 15, 20, 0.72);
   color: #c5d0dc;
   font-size: 0.9rem;
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: rgba(11, 15, 20, 0.72);
+  border: 2px dashed #f5c518;
+  color: #f5c518;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  font-size: 1.05rem;
+}
+
+.app.drop-target {
+  outline: 2px dashed #f5c518;
+  outline-offset: -4px;
 }
 
 .viewport-busy {

@@ -377,6 +377,13 @@ export default function ModelSimplifier() {
     [busy, measureMode]
   );
 
+  const onMeasurePointMove = useCallback((index: number, point: MeasurePoint) => {
+    setMeasurePoints((prev) => {
+      if (index < 0 || index >= prev.length) return prev;
+      return prev.map((p, i) => (i === index ? point : p));
+    });
+  }, []);
+
   const clearMeasure = () => setMeasurePoints([]);
 
   const startMeasure = (mode: 'line' | 'radius') => {
@@ -993,6 +1000,7 @@ export default function ModelSimplifier() {
               measurePoints={measurePoints}
               onPartClick={onPartClick}
               onSurfaceHit={onSurfaceHit}
+              onMeasurePointMove={onMeasurePointMove}
             />
             {busy && <div className="viewport-busy">Working…</div>}
             {!model && !busy && (
